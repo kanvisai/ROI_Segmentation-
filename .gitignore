@@ -1,0 +1,27 @@
+# Vídeos privados: no deben subirse al repositorio.
+videos/
+
+# Antiguo proyecto: no deben subirse al repositorio.
+antiguo_proyecto/
+
+# Entorno virtual local.
+.venv/
+
+# Resultados de inferencia (vídeo anotado y JSON).
+salidas/
+
+# Cachés de Python y herramientas.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.ruff_cache/
+
+# Checkpoints descargados dentro del proyecto.
+checkpoints/
+
+# Pesos locales de YOLO y MobileSAM.
+pesos/*.pt
+
+# Código y pesos de terceros (HOIST-Former).
+third_party/

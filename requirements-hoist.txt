@@ -1,0 +1,8 @@
+# Dependencias extra de HOIST-Former. PyTorch ya está en el venv.
+# detectron2 se compila contra ese PyTorch; no lo instales con el índice de CUDA.
+ninja
+gdown
+scipy
+shapely
+scikit-image
+h5py

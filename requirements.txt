@@ -1,0 +1,13 @@
+# PyTorch no va en este archivo: hay que instalarlo antes desde el índice CUDA
+# (ver README). Si se resuelve junto con ese índice, uv no encuentra iopath.
+
+sam3 @ git+https://github.com/facebookresearch/sam3.git
+numpy>=1.26,<2
+opencv-python-headless>=4.10
+einops
+pycocotools
+psutil
+setuptools
+tqdm
+Pillow
+ultralytics

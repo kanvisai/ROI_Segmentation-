@@ -1,0 +1,7 @@
+python yolo26_mano_objeto.py --videos videos --salida salidas
+python visor_mano_objeto.py --videos videos --salida salidas
+python track_anything_mano_objeto.py --videos videos --salida salidas
+python cutie_mano_objeto.py --videos videos --salida salidas
+python sam3_mano_objeto.py --videos videos --salida salidas
+python sam3_mano_objeto.py --videos videos --salida salidas
+python hoist_mano_objeto.py --videos videos --salida salidas

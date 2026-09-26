@@ -1,0 +1,7 @@
+# Dependencias de inferencia de Cutie. PyTorch ya está en el venv.
+# El paquete se instala desde third_party/Cutie sin sus extras de interfaz.
+hydra-core>=1.3.2
+omegaconf
+einops
+tqdm
+requests
