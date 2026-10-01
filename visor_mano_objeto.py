@@ -20,7 +20,14 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from hoist_mano_objeto import detectar_personas, leer_frames
+from hoist_mano_objeto import detectar_personas
+from pipeline_manos import (
+    describir_muestreo,
+    frame_origen,
+    leer_frames,
+    offsets_muestreo,
+    resolver_videos,
+)
 from salida_comun import Medidor, carpeta_de, publicar_comparativa
 from sam3_mano_objeto import (
     Deteccion,
@@ -35,7 +42,6 @@ from sam3_mano_objeto import (
     fraccion_dentro_de_caja,
     info_video,
     linea_temporal,
-    listar_videos,
     quitar_parpadeos,
 )
 
@@ -248,12 +254,16 @@ def seguir(frames, cajas_persona, predictor, padding, roi_min, dilatacion, ancho
     return estado, por_id, objetos_vis
 
 
-def resumen(video: Path, eventos, ultima, nframes: int) -> str:
+def resumen(video: Path, eventos, ultima, nframes: int, muestreo: dict | None = None) -> str:
     lineas = [
         f"Vídeo: {video}",
-        f"Frames: {nframes}",
+        f"Frames procesados: {nframes}",
         "Modelo: VISOR-HOS (EPIC-KITCHENS). Mano, contacto y objeto asociado.",
         "Entrenado con vídeo egocéntrico de cocina.",
+        (muestreo or {}).get(
+            "descripcion",
+            "No se ha especificado --fps. El procesamiento ha sido de frame a frame.",
+        ),
         "",
     ]
     if not eventos and ultima is None:
@@ -267,16 +277,50 @@ def resumen(video: Path, eventos, ultima, nframes: int) -> str:
     return "\n".join(lineas) + "\n"
 
 
+def _remapear_origen(frames_json, eventos, indices_origen, fps: float) -> None:
+    def orig(idx: int) -> int:
+        return frame_origen(idx, indices_origen)
+
+    for item in frames_json:
+        interno = item["frame"]
+        item["frame_procesado"] = interno
+        item["frame"] = orig(interno)
+        item["tiempo_s"] = round(orig(interno) / fps, 4) if fps else None
+        ultima = item.get("objeto", {}).get("ultima_posicion")
+        if isinstance(ultima, dict) and "frame" in ultima:
+            ultima["frame"] = orig(ultima["frame"])
+        ultima_mano = item.get("objeto", {}).get("ultima_en_mano")
+        if isinstance(ultima_mano, dict) and "frame" in ultima_mano:
+            ultima_mano["frame"] = orig(ultima_mano["frame"])
+    for evento in eventos:
+        interno = evento["frame"]
+        evento["frame_procesado"] = interno
+        evento["frame"] = orig(interno)
+        if "tiempo_s" in evento:
+            evento["tiempo_s"] = round(orig(interno) / fps, 4) if fps else None
+        for clave in ("ultima_posicion", "ultima_en_mano"):
+            extra = evento.get(clave)
+            if isinstance(extra, dict) and "frame" in extra:
+                extra["frame"] = orig(extra["frame"])
+
+
 def procesar(predictor, video: Path, args, salida: Path) -> None:
-    ancho, alto, _, fps_archivo = info_video(video)
-    frames, fps = leer_frames(video, args.max_frames)
-    if args.max_frames is None:
-        fps = fps_archivo or fps
-    print(f"\n=== {video.name}: {ancho}x{alto}, {len(frames)} frames, {fps:.3f} fps ===")
+    ancho, alto, nframes_archivo, fps_archivo = info_video(video)
+    frames, fps, indices_origen = leer_frames(video, args.max_frames, args.fps)
+    fps = fps_archivo or fps
+    nframes_origen = nframes_archivo
+    if args.max_frames is not None:
+        nframes_origen = min(nframes_origen, args.max_frames)
+    muestreo = describir_muestreo(args.fps, fps, nframes_origen, len(frames))
+    print(f"\n=== {video.name}: {ancho}x{alto}, {len(frames)} frames procesados, {fps:.3f} fps ===")
+    print(f"  {muestreo['descripcion']}")
     destino = carpeta_de(salida, "visor", video)
     medidor = Medidor("visor")
     try:
-        _procesar(predictor, video, args, destino, medidor, frames, fps, ancho, alto)
+        _procesar(
+            predictor, video, args, destino, medidor, frames, fps, ancho, alto,
+            muestreo, indices_origen,
+        )
     except Exception as exc:
         publicar_comparativa(
             salida, "visor", video.stem, "VISOR", destino, medidor.cerrar(len(frames)),
@@ -285,7 +329,8 @@ def procesar(predictor, video: Path, args, salida: Path) -> None:
         raise
 
 
-def _procesar(predictor, video, args, destino, medidor, frames, fps, ancho, alto) -> None:
+def _procesar(predictor, video, args, destino, medidor, frames, fps, ancho, alto,
+              muestreo, indices_origen) -> None:
     with medidor.etapa("segmentacion"):
         cajas = detectar_personas(frames, args.umbral_persona)
         estado, por_id, objetos = seguir(
@@ -296,12 +341,16 @@ def _procesar(predictor, video, args, destino, medidor, frames, fps, ancho, alto
         len(frames), fps, estado, cadena, frames_traspaso=args.frames_traspaso
     )
     eventos = quitar_parpadeos(eventos, args.hueco_parpadeo)
+    _remapear_origen(frames_json, eventos, indices_origen, fps)
     metricas = medidor.cerrar(len(frames))
+    offsets, _rate = offsets_muestreo(fps, args.fps)
+    fps_salida = float(args.fps) if offsets is not None else fps
     anotado = destino / "anotado.mp4"
     print(f"  Escribiendo {anotado}")
     anotar_video(
-        video, anotado, {}, -1, objetos, estado, frames_json, fps,
+        video, anotado, {}, -1, objetos, estado, frames_json, fps_salida,
         carpeta_frames=destino / "frames",
+        frames_bgr=frames,
     )
     informe = {
         "video": str(video),
@@ -310,6 +359,9 @@ def _procesar(predictor, video, args, destino, medidor, frames, fps, ancho, alto
         "alto": alto,
         "frames": len(frames),
         "fps": fps,
+        "fps_salida": fps_salida,
+        "muestreo": muestreo,
+        "indices_origen": indices_origen,
         "padding_roi": args.padding,
         "persona_de_frente": not args.de_espaldas,
         "ids_objeto": sorted({d.id_sam3 for d in cadena.detecciones}) if cadena else [],
@@ -319,7 +371,7 @@ def _procesar(predictor, video, args, destino, medidor, frames, fps, ancho, alto
     (destino / "seguimiento.json").write_text(
         json.dumps(informe, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    texto = resumen(video, eventos, ultima, len(frames))
+    texto = resumen(video, eventos, ultima, len(frames), muestreo)
     (destino / "resumen.txt").write_text(texto, encoding="utf-8")
     (destino / "metricas.json").write_text(
         json.dumps(metricas, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -354,6 +406,13 @@ def parsear_args() -> argparse.Namespace:
     parser.add_argument("--distancia-max", type=float, default=250.0)
     parser.add_argument("--de-espaldas", action="store_true")
     parser.add_argument("--frames-traspaso", type=int, default=3)
+    parser.add_argument("--video", type=Path, default=None, help="Un único vídeo. Si se indica, se ignora --videos.")
+    parser.add_argument(
+        "--fps", type=int, default=None,
+        help="Frames a procesar por cada segundo de vídeo. Con un vídeo a 15 fps, "
+             "--fps 1 toma el primero de cada segundo; --fps 2 los frames 1 y 8; "
+             "--fps 3 los frames 1, 6 y 11. Si se omite, se procesa frame a frame.",
+    )
     parser.add_argument("--max-frames", type=int, default=None)
     return parser.parse_args()
 
@@ -365,9 +424,7 @@ def main() -> None:
 
     if not torch.cuda.is_available():
         raise SystemExit("VISOR en este script necesita una GPU CUDA.")
-    videos = listar_videos(args.videos)
-    if not videos:
-        raise SystemExit(f"No hay vídeos en {args.videos}")
+    videos = resolver_videos(args)
     predictor = cargar_predictor(args.repo, args.pesos, args.config, args.umbral)
     for video in videos:
         procesar(predictor, video, args, args.salida)

@@ -1211,11 +1211,31 @@ def anotar_video(
     frames_json: list[dict],
     fps: float,
     carpeta_frames: Path | None = None,
+    frames_bgr: list | None = None,
 ) -> None:
-    from PIL import Image, ImageDraw
-
     if carpeta_frames is not None:
         carpeta_frames.mkdir(parents=True, exist_ok=True)
+    if frames_bgr:
+        alto, ancho = frames_bgr[0].shape[:2]
+        writer = cv2.VideoWriter(
+            str(destino),
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            fps,
+            (ancho, alto),
+        )
+        if not writer.isOpened():
+            raise SystemExit(f"No se pudo crear el vídeo {destino}")
+        fuente = _fuente(28)
+        fuente_peq = _fuente(22)
+        for indice, frame_bgr in enumerate(frames_bgr):
+            if indice >= len(frames_json):
+                break
+            _pintar_frame_anotado(
+                frame_bgr.copy(), indice, personas, persona_id, objetos, estado,
+                frames_json, writer, carpeta_frames, fuente, fuente_peq, fps,
+            )
+        writer.release()
+        return
     cap = cv2.VideoCapture(str(video))
     if not cap.isOpened():
         raise SystemExit(f"No se puede leer {video} para anotar")
@@ -1240,87 +1260,102 @@ def anotar_video(
             break
         if indice >= len(frames_json):
             break
-        info = frames_json[indice]
-        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-
-        persona = instancia(personas, indice, persona_id)
-        if persona is not None:
-            pintar_mascara(rgb, persona["mascara"], (40, 180, 70), 0.28)
-        for mano in estado[indice]["manos"]:
-            color = (40, 140, 255) if mano["lado"] == "izquierda" else (255, 150, 30)
-            pintar_mascara(rgb, mano["mascara"], color, 0.45)
-
-        for pose in info.get("pose") or []:
-            px, py = pose["palma_xy"]
-            color = (40, 140, 255) if pose["lado"] == "izquierda" else (255, 150, 30)
-            cv2.circle(rgb, (int(px), int(py)), 10, color, 2)
-
-        obj = info["objeto"]
-        if obj["visible"] and obj["id_sam3"] is not None:
-            en_mano = obj.get("en_mano", True)
-            color_obj = (220, 40, 200) if en_mano else (255, 160, 40)
-            inst_obj = instancia(objetos, indice, obj["id_sam3"])
-            if inst_obj is not None:
-                pintar_mascara(rgb, inst_obj["mascara"], color_obj, 0.55)
-            x0, y0, x1, y1 = obj["bbox_xyxy"]
-            cv2.rectangle(rgb, (x0, y0), (x1, y1), color_obj, 3)
-        elif obj["ultima_posicion"] is not None:
-            cx, cy = obj["ultima_posicion"]["centro_xy"]
-            ix, iy = int(cx), int(cy)
-            cv2.drawMarker(
-                rgb, (ix, iy), (220, 40, 200), cv2.MARKER_TILTED_CROSS, 28, 2
-            )
-        if obj.get("estado") == "suelto" and obj.get("ultima_en_mano"):
-            cx, cy = obj["ultima_en_mano"]["centro_xy"]
-            cv2.drawMarker(
-                rgb, (int(cx), int(cy)), (255, 210, 60), cv2.MARKER_CROSS, 22, 2
-            )
-
-        roi = info["roi_xyxy"]
-        if roi is not None:
-            cv2.rectangle(rgb, (roi[0], roi[1]), (roi[2], roi[3]), (255, 220, 0), 2)
-
-        imagen = Image.fromarray(rgb)
-        draw = ImageDraw.Draw(imagen)
-        if obj.get("estado") == "en_mano":
-            estado_txt = f"Objeto EN MANO  {obj['mano'] or '?'}"
-            color_txt = (255, 80, 220)
-        elif obj.get("estado") == "suelto":
-            estado_txt = f"Objeto SUELTO  última mano {obj['mano'] or '?'}"
-            color_txt = (255, 170, 40)
-        elif obj["ultima_posicion"] is not None:
-            ult = obj["ultima_posicion"]
-            estado_txt = (
-                f"Objeto NO visible  última pos. frame {ult['frame']} "
-                f"({ult['centro_xy'][0]:.0f}, {ult['centro_xy'][1]:.0f}) "
-                f"mano {ult['mano'] or '?'}"
-            )
-            color_txt = (255, 210, 60)
-        else:
-            estado_txt = "Objeto aún no detectado en la mano"
-            color_txt = (200, 200, 200)
-        draw.rectangle((8, 8, ancho - 8, 78), fill=(0, 0, 0))
-        draw.text((16, 12), estado_txt, fill=color_txt, font=fuente)
-        draw.text(
-            (16, 46),
-            f"frame {indice}   t={indice / fps:.2f}s   ROI persona en amarillo",
-            fill=(230, 230, 230),
-            font=fuente_peq,
+        _pintar_frame_anotado(
+            frame_bgr, indice, personas, persona_id, objetos, estado,
+            frames_json, writer, carpeta_frames, fuente, fuente_peq, fps,
         )
-        bgr = cv2.cvtColor(np.asarray(imagen), cv2.COLOR_RGB2BGR)
-        writer.write(bgr)
-        if carpeta_frames is not None:
-            cv2.imwrite(
-                str(carpeta_frames / f"frame_{indice:05d}.jpg"),
-                bgr,
-                [int(cv2.IMWRITE_JPEG_QUALITY), 95],
-            )
         indice += 1
-
     cap.release()
     writer.release()
     if carpeta_frames is not None:
-        print(f"  {indice} frames en {carpeta_frames}")
+        print(f"  {len(frames_json)} frames en {carpeta_frames}")
+
+
+def _pintar_frame_anotado(
+    frame_bgr, indice, personas, persona_id, objetos, estado, frames_json,
+    writer, carpeta_frames, fuente, fuente_peq, fps,
+) -> None:
+    from PIL import Image, ImageDraw
+
+    info = frames_json[indice]
+    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    alto, ancho = rgb.shape[:2]
+
+    persona = instancia(personas, indice, persona_id)
+    if persona is not None:
+        pintar_mascara(rgb, persona["mascara"], (40, 180, 70), 0.28)
+    for mano in estado[indice]["manos"]:
+        color = (40, 140, 255) if mano["lado"] == "izquierda" else (255, 150, 30)
+        pintar_mascara(rgb, mano["mascara"], color, 0.45)
+
+    for pose in info.get("pose") or []:
+        px, py = pose["palma_xy"]
+        color = (40, 140, 255) if pose["lado"] == "izquierda" else (255, 150, 30)
+        cv2.circle(rgb, (int(px), int(py)), 10, color, 2)
+
+    obj = info["objeto"]
+    if obj["visible"] and obj["id_sam3"] is not None:
+        en_mano = obj.get("en_mano", True)
+        color_obj = (220, 40, 200) if en_mano else (255, 160, 40)
+        inst_obj = instancia(objetos, indice, obj["id_sam3"])
+        if inst_obj is not None:
+            pintar_mascara(rgb, inst_obj["mascara"], color_obj, 0.55)
+        x0, y0, x1, y1 = obj["bbox_xyxy"]
+        cv2.rectangle(rgb, (x0, y0), (x1, y1), color_obj, 3)
+    elif obj["ultima_posicion"] is not None:
+        cx, cy = obj["ultima_posicion"]["centro_xy"]
+        ix, iy = int(cx), int(cy)
+        cv2.drawMarker(
+            rgb, (ix, iy), (220, 40, 200), cv2.MARKER_TILTED_CROSS, 28, 2
+        )
+    if obj.get("estado") == "suelto" and obj.get("ultima_en_mano"):
+        cx, cy = obj["ultima_en_mano"]["centro_xy"]
+        cv2.drawMarker(
+            rgb, (int(cx), int(cy)), (255, 210, 60), cv2.MARKER_CROSS, 22, 2
+        )
+
+    roi = info["roi_xyxy"]
+    if roi is not None:
+        cv2.rectangle(rgb, (roi[0], roi[1]), (roi[2], roi[3]), (255, 220, 0), 2)
+
+    imagen = Image.fromarray(rgb)
+    draw = ImageDraw.Draw(imagen)
+    if obj.get("estado") == "en_mano":
+        estado_txt = f"Objeto EN MANO  {obj['mano'] or '?'}"
+        color_txt = (255, 80, 220)
+    elif obj.get("estado") == "suelto":
+        estado_txt = f"Objeto SUELTO  última mano {obj['mano'] or '?'}"
+        color_txt = (255, 170, 40)
+    elif obj["ultima_posicion"] is not None:
+        ult = obj["ultima_posicion"]
+        estado_txt = (
+            f"Objeto NO visible  última pos. frame {ult['frame']} "
+            f"({ult['centro_xy'][0]:.0f}, {ult['centro_xy'][1]:.0f}) "
+            f"mano {ult['mano'] or '?'}"
+        )
+        color_txt = (255, 210, 60)
+    else:
+        estado_txt = "Objeto aún no detectado en la mano"
+        color_txt = (200, 200, 200)
+    t = info.get("t")
+    if t is None and fps:
+        t = indice / fps
+    draw.rectangle((8, 8, ancho - 8, 78), fill=(0, 0, 0))
+    draw.text((16, 12), estado_txt, fill=color_txt, font=fuente)
+    draw.text(
+        (16, 46),
+        f"frame {info.get('frame', indice)}   t={t or 0:.2f}s   ROI persona en amarillo",
+        fill=(230, 230, 230),
+        font=fuente_peq,
+    )
+    bgr = cv2.cvtColor(np.asarray(imagen), cv2.COLOR_RGB2BGR)
+    writer.write(bgr)
+    if carpeta_frames is not None:
+        cv2.imwrite(
+            str(carpeta_frames / f"frame_{info.get('frame', indice):05d}.jpg"),
+            bgr,
+            [int(cv2.IMWRITE_JPEG_QUALITY), 95],
+        )
 
 
 def quitar_parpadeos(eventos: list[dict], max_hueco: int) -> list[dict]:

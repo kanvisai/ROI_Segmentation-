@@ -165,23 +165,98 @@ def listar_videos(ruta: Path) -> list[Path]:
     return videos
 
 
-def leer_frames(video: Path, max_frames: int | None) -> tuple[list[np.ndarray], float]:
+def offsets_muestreo(fps_video: float, fps_proceso: int | None) -> tuple[set[int] | None, int]:
+    """Offsets dentro de cada segundo de vídeo. ``None`` = todos los frames."""
+    rate = max(1, int(round(float(fps_video) or 25.0)))
+    if fps_proceso is None:
+        return None, rate
+    n = int(fps_proceso)
+    if n < 1:
+        raise SystemExit("--fps debe ser un entero mayor o igual que 1")
+    if n >= rate:
+        return None, rate
+    return {int(i * rate / n) for i in range(n)}, rate
+
+
+def describir_muestreo(fps_proceso, fps_video: float, n_origen: int, n_procesados: int) -> dict:
+    """Texto y metadatos de si --fps se usó o el análisis fue frame a frame."""
+    offsets, rate = offsets_muestreo(fps_video, fps_proceso)
+    base = {
+        "fps_video": round(float(fps_video), 4),
+        "rate_entero": rate,
+        "frames_origen": n_origen,
+        "frames_procesados": n_procesados,
+    }
+    if fps_proceso is None:
+        return {
+            **base,
+            "especificado": False,
+            "fps_parametro": None,
+            "descripcion": (
+                "No se ha especificado --fps. El procesamiento ha sido de frame a frame."
+            ),
+        }
+    if offsets is None:
+        return {
+            **base,
+            "especificado": True,
+            "fps_parametro": int(fps_proceso),
+            "descripcion": (
+                f"Se ha establecido --fps {int(fps_proceso)}, igual o mayor que el rate "
+                f"del vídeo ({rate} fps). El procesamiento ha sido de frame a frame."
+            ),
+        }
+    ejemplo = ", ".join(str(i + 1) for i in sorted(offsets))
+    descripcion = (
+        f"Se ha establecido --fps {int(fps_proceso)}. El vídeo va a {fps_video:.3f} fps "
+        f"(rate {rate}): de cada segundo se procesan los frames {ejemplo} "
+        f"({n_procesados} de {n_origen} frames)."
+    )
+    return {
+        "especificado": True,
+        "fps_parametro": int(fps_proceso),
+        "fps_video": round(float(fps_video), 4),
+        "rate_entero": rate,
+        "frames_origen": n_origen,
+        "frames_procesados": n_procesados,
+        "offsets_en_segundo": sorted(offsets),
+        "descripcion": descripcion,
+    }
+
+
+def frame_origen(indice: int, indices_origen: list[int] | None) -> int:
+    if not indices_origen or indice < 0 or indice >= len(indices_origen):
+        return indice
+    return int(indices_origen[indice])
+
+
+def leer_frames(
+    video: Path,
+    max_frames: int | None,
+    fps_proceso: int | None = None,
+) -> tuple[list[np.ndarray], float, list[int]]:
     cap = cv2.VideoCapture(str(video))
     if not cap.isOpened():
         raise SystemExit(f"No se puede abrir {video}")
     fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0) or 25.0
-    frames = []
+    offsets, rate = offsets_muestreo(fps, fps_proceso)
+    frames: list[np.ndarray] = []
+    origen: list[int] = []
+    indice = 0
     while True:
         ok, frame = cap.read()
         if not ok:
             break
-        frames.append(frame)
-        if max_frames is not None and len(frames) >= max_frames:
+        if offsets is None or (indice % rate) in offsets:
+            frames.append(frame)
+            origen.append(indice)
+        indice += 1
+        if max_frames is not None and indice >= max_frames:
             break
     cap.release()
     if not frames:
         raise SystemExit(f"{video} no tiene frames")
-    return frames, fps
+    return frames, fps, origen
 
 
 def resolver_videos(args) -> list[Path]:
@@ -1117,23 +1192,22 @@ def _etiqueta_mano(mano: str | None) -> str:
     return {"izquierda": "IZQ", "derecha": "DER", "ambas": "AMBAS"}.get(mano or "", "SUELTO")
 
 
-def anotar(video: Path, destino: Path, objetos: list[Objeto], contenedores, fps: float,
-           carpeta_frames: Path | None, alfa: float, limite: int,
+def anotar(frames, destino: Path, objetos: list[Objeto], contenedores, fps_salida: float,
+           fps_video: float, indices_origen: list[int] | None,
+           carpeta_frames: Path | None, alfa: float,
            contextos=None, dibujar_esqueleto: bool = True) -> int:
     """Máscaras de objeto, ROI de identificadores y pose YOLO de la cintura hacia arriba."""
-    cap = cv2.VideoCapture(str(video))
-    ancho = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    alto = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    if not frames:
+        return 0
+    alto, ancho = frames[0].shape[:2]
     escritor = cv2.VideoWriter(
-        str(destino), cv2.VideoWriter_fourcc(*"mp4v"), fps or 25.0, (ancho, alto)
+        str(destino), cv2.VideoWriter_fourcc(*"mp4v"), fps_salida or 25.0, (ancho, alto)
     )
     if carpeta_frames is not None:
         carpeta_frames.mkdir(parents=True, exist_ok=True)
-    indice = 0
-    while indice < limite:
-        ok, frame = cap.read()
-        if not ok:
-            break
+    for indice, original in enumerate(frames):
+        frame = original.copy()
+        orig = frame_origen(indice, indices_origen)
         for pista in contenedores:
             x1, y1, x2, y2 = caja_contenedor(pista, indice)
             color = COLOR_CONTENEDOR if pista.get("destino") else COLOR_IDENTIFICADOR
@@ -1163,22 +1237,21 @@ def anotar(video: Path, destino: Path, objetos: list[Objeto], contenedores, fps:
             dibujar_pose(frame, contextos[indice])
         cv2.rectangle(frame, (0, 0), (ancho, 34), (0, 0, 0), -1)
         activos = sum(1 for o in objetos if indice in o.vistas)
+        t = orig / fps_video if fps_video else 0.0
         cv2.putText(
             frame,
-            f"frame {indice}  t={indice / fps:.2f}s  objetos en mano: {activos}",
+            f"frame {orig}  t={t:.2f}s  objetos en mano: {activos}",
             (12, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (240, 240, 240), 1, cv2.LINE_AA,
         )
         escritor.write(frame)
         if carpeta_frames is not None:
             cv2.imwrite(
-                str(carpeta_frames / f"frame_{indice:05d}.jpg"),
+                str(carpeta_frames / f"frame_{orig:05d}.jpg"),
                 frame,
                 [int(cv2.IMWRITE_JPEG_QUALITY), 95],
             )
-        indice += 1
-    cap.release()
     escritor.release()
-    return indice
+    return len(frames)
 
 
 # --------------------------------------------------------------------------- #
@@ -1186,16 +1259,22 @@ def anotar(video: Path, destino: Path, objetos: list[Objeto], contenedores, fps:
 # --------------------------------------------------------------------------- #
 
 
-def informe_objeto(objeto: Objeto, fps: float, nframes: int, contenedores, args) -> dict:
+def informe_objeto(objeto: Objeto, fps: float, nframes: int, contenedores, args,
+                   indices_origen: list[int] | None = None) -> dict:
     vistas = [objeto.vistas[i] for i in sorted(objeto.vistas)]
     contenedor = contenedor_final(vistas, contenedores, args)
     manos = {"izquierda": 0, "derecha": 0, "ambas": 0, "sin_mano": 0}
     for vista in vistas:
         manos[vista.mano or "sin_mano"] += 1
+
+    def orig(idx: int) -> int:
+        return frame_origen(idx, indices_origen)
+
     linea = [
         {
-            "frame": v.frame,
-            "t": round(v.frame / fps, 4) if fps else None,
+            "frame": orig(v.frame),
+            "frame_procesado": v.frame,
+            "t": round(orig(v.frame) / fps, 4) if fps else None,
             "mano": v.mano,
             "roi": list(v.caja),
             "centro": [round(v.centro[0], 2), round(v.centro[1], 2)],
@@ -1207,12 +1286,18 @@ def informe_objeto(objeto: Objeto, fps: float, nframes: int, contenedores, args)
         for v in vistas
     ]
     en_mano = [v for v in vistas if v.mano]
+    eventos = eventos_de(objeto, fps, args)
+    for evento in eventos:
+        interno = evento["frame"]
+        evento["frame_procesado"] = interno
+        evento["frame"] = orig(interno)
+        evento["t"] = round(orig(interno) / fps, 4) if fps else None
     return {
         "id": objeto.id,
         "frames_visible": len(vistas),
         "frames_en_mano": len(en_mano),
-        "primer_frame": vistas[0].frame if vistas else None,
-        "ultimo_frame": vistas[-1].frame if vistas else None,
+        "primer_frame": orig(vistas[0].frame) if vistas else None,
+        "ultimo_frame": orig(vistas[-1].frame) if vistas else None,
         "resiembras": objeto.resiembras,
         "manos": manos,
         "mano_predominante": max(manos, key=manos.get) if vistas else None,
@@ -1220,23 +1305,27 @@ def informe_objeto(objeto: Objeto, fps: float, nframes: int, contenedores, args)
         "ultimo_centro": (
             [round(vistas[-1].centro[0], 2), round(vistas[-1].centro[1], 2)] if vistas else None
         ),
-        "ultimo_frame_visible": vistas[-1].frame if vistas else None,
+        "ultimo_frame_visible": orig(vistas[-1].frame) if vistas else None,
         "estado_final": estado_final(objeto, nframes, contenedor, args),
         "acaba_en_contenedor": contenedor is not None,
         "contenedor_final": contenedor,
-        "eventos": eventos_de(objeto, fps, args),
+        "eventos": eventos,
         "linea_temporal": linea,
     }
 
 
 def resumen(video: Path, informes: list[dict], contenedores, nframes: int, modelo: str,
-            yaml_identificadores: Path | None = None) -> str:
+            yaml_identificadores: Path | None = None, muestreo: dict | None = None) -> str:
     lineas = [
         f"Vídeo: {video}",
-        f"Frames: {nframes}",
+        f"Frames procesados: {nframes}",
         f"Modelo: {modelo}. Las muñecas salen de YOLO26n-pose, el objeto del recorte de "
         "la muñeca y los identificadores de escena del YAML "
         f"({yaml_identificadores or YAML_IDENTIFICADORES}).",
+        (muestreo or {}).get(
+            "descripcion",
+            "No se ha especificado --fps. El procesamiento ha sido de frame a frame.",
+        ),
         "",
     ]
     if contenedores:
@@ -1347,6 +1436,12 @@ def anadir_argumentos_comunes(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--factor-contenedor", type=float, default=2.5)
     parser.add_argument("--frames-fin", type=int, default=5)
     parser.add_argument("--alfa", type=float, default=0.55)
+    parser.add_argument(
+        "--fps", type=int, default=None,
+        help="Frames a procesar por cada segundo de vídeo. Con un vídeo a 15 fps, "
+             "--fps 1 toma el primero de cada segundo; --fps 2 los frames 1 y 8; "
+             "--fps 3 los frames 1, 6 y 11. Si se omite, se procesa frame a frame.",
+    )
     parser.add_argument("--max-frames", type=int, default=None)
 
 
@@ -1390,9 +1485,12 @@ def escribir_salidas(
     objetos: list[Objeto],
     contenedores: list[dict],
     contextos,
+    frames,
+    indices_origen: list[int],
     metricas: dict,
     fps: float,
     nframes: int,
+    nframes_origen: int,
     ancho: int,
     alto: int,
     tecnologia: str,
@@ -1400,23 +1498,35 @@ def escribir_salidas(
     modelo: str,
     extra: dict | None = None,
 ) -> None:
-    informes = [informe_objeto(o, fps, nframes, contenedores, args) for o in objetos]
+    muestreo = describir_muestreo(args.fps, fps, nframes_origen, nframes)
+    informes = [
+        informe_objeto(o, fps, nframes, contenedores, args, indices_origen) for o in objetos
+    ]
+    offsets, _rate = offsets_muestreo(fps, args.fps)
+    fps_salida = float(args.fps) if offsets is not None else fps
     anotado = destino / "anotado.mp4"
     print(f"  Escribiendo {anotado}")
     escritos = anotar(
-        video, anotado, objetos, contenedores, fps,
-        destino / "frames" if not args.sin_frames else None, args.alfa, nframes,
+        frames, anotado, objetos, contenedores, fps_salida, fps, indices_origen,
+        destino / "frames" if not args.sin_frames else None, args.alfa,
         contextos, dibujar_esqueleto=not args.sin_pose,
     )
     if not args.sin_frames:
         print(f"  {escritos} frames en {destino / 'frames'}")
+
+    def orig(idx: int) -> int:
+        return frame_origen(idx, indices_origen)
+
     traza = {
         "video": str(video),
         "modelo": modelo,
         "ancho": ancho,
         "alto": alto,
         "frames": nframes,
+        "frames_origen": nframes_origen,
         "fps": fps,
+        "fps_salida": fps_salida,
+        "muestreo": muestreo,
         "parametros": {
             "padding_muneca": args.padding_muneca,
             "crop_min": args.crop_min,
@@ -1428,6 +1538,7 @@ def escribir_salidas(
             "dentro_min": args.dentro_min,
             "factor_contenedor": args.factor_contenedor,
             "identificadores_yaml": str(args.identificadores),
+            "fps": args.fps,
         },
         "identificadores_yaml": [
             {
@@ -1448,13 +1559,13 @@ def escribir_salidas(
                 "prompt": p["texto"],
                 "score_medio": p["score_medio"],
                 "score_max": p["score_max"],
-                "primer_frame": p["primer_frame"],
-                "ultimo_frame": p["ultimo_frame"],
+                "primer_frame": orig(p["primer_frame"]),
+                "ultimo_frame": orig(p["ultimo_frame"]),
                 "frames_visto": p["frames_visto"],
                 "destino": bool(p.get("destino", False)),
                 "accesorio": bool(p.get("accesorio", False)),
                 "roi_ultimo": list(p["caja"]),
-                "rois": {str(f): list(c) for f, c in sorted(p["cajas"].items())},
+                "rois": {str(orig(f)): list(c) for f, c in sorted(p["cajas"].items())},
             }
             for p in contenedores
         ],
@@ -1466,7 +1577,7 @@ def escribir_salidas(
         json.dumps(traza, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     texto = resumen(
-        video, informes, contenedores, nframes, modelo, args.identificadores,
+        video, informes, contenedores, nframes, modelo, args.identificadores, muestreo,
     )
     (destino / "resumen.txt").write_text(texto, encoding="utf-8")
     (destino / "metricas.json").write_text(
@@ -1494,11 +1605,15 @@ def procesar_video(
     seguir,
     extra: dict | None = None,
 ) -> None:
-    ancho, alto, _, fps_archivo = info_video(video)
-    frames, fps = leer_frames(video, args.max_frames)
-    if args.max_frames is None:
-        fps = fps_archivo or fps
-    print(f"\n=== {video.name}: {ancho}x{alto}, {len(frames)} frames, {fps:.3f} fps ===")
+    ancho, alto, nframes_archivo, fps_archivo = info_video(video)
+    frames, fps, indices_origen = leer_frames(video, args.max_frames, args.fps)
+    fps = fps_archivo or fps
+    nframes_origen = nframes_archivo
+    if args.max_frames is not None:
+        nframes_origen = min(nframes_origen, args.max_frames)
+    muestreo = describir_muestreo(args.fps, fps, nframes_origen, len(frames))
+    print(f"\n=== {video.name}: {ancho}x{alto}, {len(frames)} frames procesados, {fps:.3f} fps ===")
+    print(f"  {muestreo['descripcion']}")
     destino = carpeta_de(args.salida, tecnologia, video)
     medidor = Medidor(tecnologia)
     try:
@@ -1513,9 +1628,9 @@ def procesar_video(
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         escribir_salidas(
-            video, args, destino, objetos, contenedores, contextos,
+            video, args, destino, objetos, contenedores, contextos, frames, indices_origen,
             medidor.cerrar(len(frames)),
-            fps, len(frames), ancho, alto, tecnologia, backend, modelo, extra,
+            fps, len(frames), nframes_origen, ancho, alto, tecnologia, backend, modelo, extra,
         )
     except Exception as exc:
         publicar_comparativa(

@@ -199,22 +199,10 @@ def _manos_a_resolucion(logits, tam_padded, tam_sin_pad, alto, ancho, como_maxim
     return [(elegidas[i] > 0).detach().cpu() for i in range(elegidas.shape[0])]
 
 
-def leer_frames(video: Path, max_frames: int | None) -> tuple[list[np.ndarray], float]:
-    cap = cv2.VideoCapture(str(video))
-    if not cap.isOpened():
-        raise SystemExit(f"No se puede abrir {video}")
-    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0) or 25.0
-    frames = []
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        frames.append(frame)
-        if max_frames is not None and len(frames) >= max_frames:
-            break
-    cap.release()
-    if not frames:
-        raise SystemExit(f"{video} no tiene frames")
+def leer_frames(video: Path, max_frames: int | None, fps_proceso: int | None = None):
+    from pipeline_manos import leer_frames as _leer
+
+    frames, fps, _origen = _leer(video, max_frames, fps_proceso)
     return frames, fps
 
 
