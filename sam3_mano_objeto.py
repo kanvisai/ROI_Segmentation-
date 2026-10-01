@@ -28,6 +28,13 @@ os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 import cv2
 import numpy as np
 
+from pipeline_manos import (
+    anadir_argumentos_comunes,
+    cargar_detectores,
+    procesar_video,
+    resolver_videos,
+    seguir_por_deteccion,
+)
 from salida_comun import Medidor, carpeta_de, publicar_comparativa
 
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
@@ -1419,192 +1426,23 @@ def resumen_texto(video: Path, eventos: list[dict], ultima: dict | None, nframes
     return "\n".join(lineas) + "\n"
 
 
-def procesar_video(predictor, video: Path, args, salida_dir: Path) -> None:
-    ancho, alto, nframes, fps = info_video(video)
-    print(f"\n=== {video.name}: {ancho}x{alto}, {nframes} frames, {fps:.3f} fps ===")
-    destino = carpeta_de(salida_dir, "sam3", video)
-    medidor = Medidor("sam3")
-    try:
-        _procesar_sam3(predictor, video, args, destino, medidor, ancho, alto, nframes, fps)
-    except Exception as exc:
-        publicar_comparativa(
-            salida_dir, "sam3", video.stem, "SAM 3", destino, medidor.cerrar(nframes),
-            0, 0, 0, ok=False, codigo=1, error=str(exc),
-        )
-        raise
-
-
-def _procesar_sam3(predictor, video, args, destino, medidor, ancho, alto, nframes, fps) -> None:
-    with medidor.etapa("segmentacion"):
-        personas = seguir_concepto(predictor, video, args.prompt_persona, args.umbral)
-        persona_id = elegir_persona(personas)
-        if persona_id is None:
-            print("  No se segmentó ninguna persona. Se omite este vídeo.")
-            metricas = medidor.cerrar(nframes)
-            (destino / "metricas.json").write_text(
-                json.dumps(metricas, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-            publicar_comparativa(
-                args.salida, "sam3", video.stem, "SAM 3", destino, metricas,
-                0, 0, 0, ok=False, codigo=0, error="sin persona",
-            )
-            return
-        print(f"  Persona principal: id SAM 3 {persona_id}")
-        manos = seguir_concepto(predictor, video, args.prompt_mano, args.umbral)
-        palma = detecciones_palma(video, nframes)
-        if palma is not None:
-            por_id_palma, objetos = palma
-        else:
-            por_id_palma = None
-            objetos = seguir_concepto(predictor, video, args.prompt_objeto, args.umbral)
-        pose = None if args.sin_pose else analizar_pose(video, nframes, args.modelo_pose)
-        estado, por_id = asociar_objetos(
-            nframes=nframes,
-            personas=personas,
-            persona_id=persona_id,
-            manos=manos,
-            objetos=objetos,
-            ancho=ancho,
-            alto=alto,
-            padding=args.padding,
-            dilatacion=args.dilatacion_mano,
-            contacto_min=args.contacto_min,
-            roi_min=args.roi_min,
-            de_frente=not args.de_espaldas,
-            manos_pose=pose,
-            umbral_agarre=args.umbral_agarre,
-        )
-    if por_id_palma is not None:
-        por_id = por_id_palma
-    cadena = encadenar(por_id, args.hueco_max, args.distancia_max)
-    frames_json, eventos, ultima = linea_temporal(
-        nframes, fps, estado, cadena, frames_traspaso=args.frames_traspaso
-    )
-    eventos = quitar_parpadeos(eventos, 3)
-    metricas = medidor.cerrar(nframes)
-
-    anotado = destino / "anotado.mp4"
-    print(f"  Escribiendo {anotado}")
-    anotar_video(
-        video, anotado, personas, persona_id, objetos, estado, frames_json, fps,
-        carpeta_frames=destino / "frames",
-    )
-
-    informe = {
-        "video": str(video),
-        "ancho": ancho,
-        "alto": alto,
-        "frames": nframes,
-        "fps": fps,
-        "prompts": {
-            "persona": args.prompt_persona,
-            "mano": args.prompt_mano,
-            "objeto": args.prompt_objeto,
-        },
-        "padding_roi": args.padding,
-        "persona_de_frente": not args.de_espaldas,
-        "persona_id_sam3": persona_id,
-        "ids_objeto_sam3": sorted({d.id_sam3 for d in cadena.detecciones})
-        if cadena
-        else [],
-        "eventos": eventos,
-        "linea_temporal": frames_json,
-    }
-    (destino / "seguimiento.json").write_text(
-        json.dumps(informe, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    texto = resumen_texto(video, eventos, ultima, nframes)
-    (destino / "resumen.txt").write_text(texto, encoding="utf-8")
-    (destino / "metricas.json").write_text(
-        json.dumps(metricas, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    frames_con_objeto = sum(1 for frame in frames_json if frame["objeto"]["visible"])
-    objetos_n = len({d.id_sam3 for d in cadena.detecciones}) if cadena else 0
-    desapariciones = sum(1 for ev in eventos if ev["tipo"] == "desaparece")
-    ruta = publicar_comparativa(
-        args.salida, "sam3", video.stem, "SAM 3", destino, metricas,
-        objetos_n, desapariciones, frames_con_objeto,
-    )
-    print(texto)
-    print(f"  Comparativa: {ruta}")
-
 
 def parsear_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="SAM 3: ROI de la persona y seguimiento del objeto en la mano."
+        description="SAM 3: objetos en la mano con ROI de muñeca y contenedores."
     )
-    parser.add_argument(
-        "--videos",
-        type=Path,
-        default=Path("videos"),
-        help="Vídeo o carpeta de vídeos (por defecto: videos/).",
-    )
-    parser.add_argument(
-        "--salida",
-        type=Path,
-        default=Path("salidas"),
-        help="Carpeta de resultados (por defecto: salidas/).",
-    )
-    parser.add_argument("--prompt-persona", default="person")
-    parser.add_argument("--prompt-mano", default="hand")
-    parser.add_argument(
-        "--prompt-objeto",
-        default="object held in the hand",
-        help="Concepto en inglés del objeto. Si falla, usa un nombre concreto (bottle, cup, phone).",
-    )
-    parser.add_argument(
-        "--padding",
-        type=float,
-        default=0.35,
-        help="Padding del ROI como fracción del ancho y alto de la persona.",
-    )
-    parser.add_argument("--umbral", type=float, default=0.5, help="Probabilidad mínima de SAM 3.")
-    parser.add_argument("--dilatacion-mano", type=int, default=28)
-    parser.add_argument("--contacto-min", type=float, default=0.08)
-    parser.add_argument(
-        "--umbral-agarre",
-        type=float,
-        default=0.35,
-        help="Puntuación mínima de palma y dedos para dar el objeto por cogido.",
-    )
-    parser.add_argument(
-        "--frames-traspaso",
-        type=int,
-        default=3,
-        help="Frames seguidos en la otra mano antes de anotar el cambio.",
-    )
-    parser.add_argument(
-        "--modelo-pose",
-        type=Path,
-        default=ruta_pose_por_defecto(),
-        help="YOLO-pose para la muñeca izquierda y derecha de la persona.",
-    )
-    parser.add_argument(
-        "--sin-pose",
-        action="store_true",
-        help="No usa el esqueleto. El lado de la mano sale de la imagen.",
-    )
-    parser.add_argument("--roi-min", type=float, default=0.5)
-    parser.add_argument("--hueco-max", type=int, default=45)
-    parser.add_argument("--distancia-max", type=float, default=250.0)
-    parser.add_argument(
-        "--de-espaldas",
-        action="store_true",
-        help="La persona no mira a la cámara. Por defecto se asume que está de frente, "
-        "así que su mano izquierda cae a la derecha de la imagen.",
-    )
-    parser.add_argument(
-        "--version",
-        choices=("sam3.1", "sam3"),
-        default="sam3.1",
-        help="sam3.1 es el checkpoint actual (Object Multiplex). sam3 es el de noviembre 2025.",
-    )
-    parser.add_argument(
-        "--lote",
-        type=int,
-        default=4,
-        help="Frames que SAM 3 procesa a la vez. 16 no cabe en 32 GiB si hay otros procesos en la GPU.",
+    anadir_argumentos_comunes(parser)
+    parser.add_argument("--version", choices=("sam3.1", "sam3"), default="sam3.1")
+    parser.add_argument("--lote", type=int, default=4)
+    parser.set_defaults(
+        min_detecciones=3,
+        umbral_agarre=0.35,
+        contacto_min=0.12,
+        area_max_px=5000,
+        area_max_persona=0.02,
+        conf_objeto_crop=0.15,
+        factor_palma=0.85,
+        distancia_max=280.0,
     )
     return parser.parse_args()
 
@@ -1612,17 +1450,12 @@ def parsear_args() -> argparse.Namespace:
 def main() -> None:
     args = parsear_args()
     comprobar_entorno()
-    videos = listar_videos(args.videos)
-    args.salida.mkdir(parents=True, exist_ok=True)
-    if args.lote < 1:
-        raise SystemExit("--lote tiene que ser al menos 1.")
-    predictor = construir_predictor(args.version, args.umbral, args.lote)
-    try:
-        for video in videos:
-            procesar_video(predictor, video, args, args.salida)
-    finally:
-        if hasattr(predictor, "shutdown"):
-            predictor.shutdown()
+    detectores = cargar_detectores(args)
+    for video in resolver_videos(args):
+        procesar_video(
+            detectores, video, args, "sam3", "SAM 3",
+            "SAM 3", seguir_por_deteccion,
+        )
     print(f"\nListo. Resultados en {args.salida.resolve()}")
 
 

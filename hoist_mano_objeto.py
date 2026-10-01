@@ -21,6 +21,13 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from pipeline_manos import (
+    anadir_argumentos_comunes,
+    cargar_detectores,
+    procesar_video,
+    resolver_videos,
+    seguir_por_deteccion,
+)
 from salida_comun import Medidor, carpeta_de, publicar_comparativa
 from sam3_mano_objeto import (
     Deteccion,
@@ -521,171 +528,26 @@ def resumen(video: Path, eventos: list[dict], ultima: dict | None, nframes: int)
     return "\n".join(lineas) + "\n"
 
 
-def procesar(predictor, video: Path, args, salida: Path) -> None:
-    ancho, alto, _, fps_archivo = info_video(video)
-    frames, fps = leer_frames(video, args.max_frames)
-    if args.max_frames is None:
-        fps = fps_archivo or fps
-    print(f"\n=== {video.name}: {ancho}x{alto}, {len(frames)} frames, {fps:.3f} fps ===")
-    destino = carpeta_de(salida, "hoist", video)
-    medidor = Medidor("hoist")
-    try:
-        _procesar_hoist(predictor, video, args, destino, medidor, frames, fps, ancho, alto)
-    except Exception as exc:
-        publicar_comparativa(
-            salida, "hoist", video.stem, "HOIST-Former", destino, medidor.cerrar(len(frames)),
-            0, 0, 0, ok=False, codigo=1, error=str(exc),
-        )
-        raise
-
-
-def _procesar_hoist(predictor, video, args, destino, medidor, frames, fps, ancho, alto) -> None:
-    with medidor.etapa("segmentacion"):
-        cajas = detectar_personas(frames, args.umbral_persona)
-        pose = None if args.sin_pose else analizar_pose(frames, len(frames), args.modelo_pose)
-        pistas, manos = inferir(
-            predictor,
-            frames,
-            ventana=args.ventana,
-            solape=args.solape,
-            umbral=args.umbral,
-            area_min=args.area_min,
-            iou_min=args.iou_ventana,
-        )
-        estado, por_id, objetos = asociar(
-            nframes=len(frames),
-            ancho=ancho,
-            alto=alto,
-            cajas_persona=cajas,
-            manos_por_frame=manos,
-            pistas=pistas,
-            padding=args.padding,
-            dilatacion=args.dilatacion_mano,
-            roi_min=args.roi_min,
-            contacto_min=args.contacto_min,
-            de_frente=not args.de_espaldas,
-            manos_pose=pose,
-            umbral_agarre=args.umbral_agarre,
-        )
-        palma = detecciones_palma(frames, len(frames))
-        if palma is not None:
-            por_id, objetos = palma
-    cadena = encadenar(por_id, args.hueco_max, args.distancia_max)
-    frames_json, eventos, ultima = linea_temporal(
-        len(frames), fps, estado, cadena, frames_traspaso=args.frames_traspaso
-    )
-    eventos = quitar_parpadeos(eventos, args.hueco_parpadeo)
-    metricas = medidor.cerrar(len(frames))
-    anotado = destino / "anotado.mp4"
-    print(f"  Escribiendo {anotado}")
-    anotar_video(
-        video,
-        anotado,
-        {},
-        -1,
-        objetos,
-        estado,
-        frames_json,
-        fps,
-        carpeta_frames=destino / "frames",
-    )
-    informe = {
-        "video": str(video),
-        "modelo": "HOIST-Former",
-        "ancho": ancho,
-        "alto": alto,
-        "frames": len(frames),
-        "fps": fps,
-        "padding_roi": args.padding,
-        "ventana": args.ventana,
-        "persona_de_frente": not args.de_espaldas,
-        "ids_objeto": sorted({d.id_sam3 for d in cadena.detecciones}) if cadena else [],
-        "eventos": eventos,
-        "linea_temporal": frames_json,
-    }
-    (destino / "seguimiento.json").write_text(
-        json.dumps(informe, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    texto = resumen(video, eventos, ultima, len(frames))
-    (destino / "resumen.txt").write_text(texto, encoding="utf-8")
-    (destino / "metricas.json").write_text(
-        json.dumps(metricas, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    frames_con_objeto = sum(1 for frame in frames_json if frame["objeto"]["visible"])
-    objetos_n = len({d.id_sam3 for d in cadena.detecciones}) if cadena else 0
-    desapariciones = sum(1 for ev in eventos if ev["tipo"] == "desaparece")
-    ruta = publicar_comparativa(
-        args.salida, "hoist", video.stem, "HOIST-Former", destino, metricas,
-        objetos_n, desapariciones, frames_con_objeto,
-    )
-    print(texto)
-    print(f"  Comparativa: {ruta}")
-
 
 def parsear_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="HOIST-Former: ROI de la persona y seguimiento del objeto en la mano."
+        description="HOIST-Former: objetos en la mano con ROI de muñeca y contenedores."
     )
-    parser.add_argument("--videos", type=Path, default=Path("videos"))
-    parser.add_argument("--salida", type=Path, default=Path("salidas"))
+    anadir_argumentos_comunes(parser)
+    parser.add_argument("--repo", type=Path, default=HOIST_RAIZ)
     parser.add_argument("--pesos", type=Path, default=PESOS_POR_DEFECTO)
-    parser.add_argument("--padding", type=float, default=0.35)
-    parser.add_argument("--umbral", type=float, default=0.5, help="Puntuación mínima de la pista HOIST.")
-    parser.add_argument("--umbral-persona", type=float, default=0.6)
-    parser.add_argument(
-        "--lado-corto",
-        type=int,
-        default=1080,
-        help="Lado corto al que se reescala el frame antes de HOIST. 360 es el valor del paper y pierde objetos pequeños.",
-    )
-    parser.add_argument("--lado-largo", type=int, default=1920)
-    parser.add_argument("--ventana", type=int, default=4, help="Frames que HOIST ve a la vez. A 1080p, 4 cabe en la GPU.")
-    parser.add_argument("--solape", type=int, default=2, help="Frames compartidos entre ventanas, para coser las pistas.")
-    parser.add_argument("--area-min", type=int, default=400)
-    parser.add_argument("--iou-ventana", type=float, default=0.3)
-    parser.add_argument("--dilatacion-mano", type=int, default=28)
-    parser.add_argument("--contacto-min", type=float, default=0.08)
-    parser.add_argument("--roi-min", type=float, default=0.5)
-    parser.add_argument("--hueco-max", type=int, default=45)
-    parser.add_argument(
-        "--hueco-parpadeo",
-        type=int,
-        default=3,
-        help="Huecos de hasta estos frames no cuentan como desaparición.",
-    )
-    parser.add_argument("--distancia-max", type=float, default=250.0)
-    parser.add_argument("--de-espaldas", action="store_true")
-    parser.add_argument("--umbral-agarre", type=float, default=0.35)
-    parser.add_argument("--frames-traspaso", type=int, default=3)
-    parser.add_argument("--modelo-pose", type=Path, default=ruta_pose_por_defecto())
-    parser.add_argument("--sin-pose", action="store_true")
-    parser.add_argument(
-        "--max-frames",
-        type=int,
-        default=None,
-        help="Procesa solo los primeros N frames. Útil para una prueba corta.",
-    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parsear_args()
     comprobar_entorno()
-    if not args.pesos.is_file():
-        raise SystemExit(
-            f"No están los pesos en {args.pesos}.\n"
-            "Descárgalos con el entorno activado:\n"
-            "  gdown 1yLXCqt8mQroqQYDnncMvJ3HaOKMln8Xs "
-            f"-O {args.pesos}"
+    detectores = cargar_detectores(args)
+    for video in resolver_videos(args):
+        procesar_video(
+            detectores, video, args, "hoist", "HOIST-Former",
+            "HOIST-Former", seguir_por_deteccion,
         )
-    if args.solape >= args.ventana:
-        raise SystemExit("--solape tiene que ser menor que --ventana.")
-    videos = listar_videos(args.videos)
-    args.salida.mkdir(parents=True, exist_ok=True)
-    predictor = cargar_predictor(args.pesos, args.lado_corto, args.lado_largo)
-    for video in videos:
-        procesar(predictor, video, args, args.salida)
     print(f"\nListo. Resultados en {args.salida.resolve()}")
 
 

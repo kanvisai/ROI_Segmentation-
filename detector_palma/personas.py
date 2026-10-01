@@ -24,6 +24,36 @@ AYUDA_ULTRALYTICS = "pip install ultralytics"
 MUNECA_IZQ, MUNECA_DER = 9, 10
 CODO_IZQ, CODO_DER = 7, 8
 HOMBRO_IZQ, HOMBRO_DER = 5, 6
+CADERA_IZQ, CADERA_DER = 11, 12
+
+# Esqueleto de la cintura hacia arriba (COCO-17). Las piernas (13-16) no se dibujan.
+POSE_NOMBRES = {
+    0: "nariz",
+    5: "hombro IZQ",
+    6: "hombro DER",
+    7: "codo IZQ",
+    8: "codo DER",
+    9: "muñeca IZQ",
+    10: "muñeca DER",
+    11: "cadera IZQ",
+    12: "cadera DER",
+}
+POSE_HUESOS = (
+    (5, 6),
+    (11, 12),
+    (5, 11),
+    (6, 12),
+    (5, 7),
+    (7, 9),
+    (6, 8),
+    (8, 10),
+    (0, 5),
+    (0, 6),
+)
+COLOR_POSE_IZQ = (40, 140, 255)
+COLOR_POSE_DER = (255, 150, 30)
+COLOR_POSE_TORSO = (0, 220, 180)
+COLOR_PALMA = (80, 255, 80)
 
 
 @dataclass
@@ -76,6 +106,56 @@ class ContextoEscena:
         x2 = max(p.caja_padded[2] for p in self.personas)
         y2 = max(p.caja_padded[3] for p in self.personas)
         return (x1, y1, x2, y2)
+
+
+def _xy_keypoint(kp: np.ndarray, indice: int, umbral: float):
+    """Devuelve (x, y) entero si el punto existe y supera el umbral de confianza."""
+    if indice >= len(kp):
+        return None
+    fila = kp[indice]
+    if fila.shape[0] < 2:
+        return None
+    x, y = float(fila[0]), float(fila[1])
+    conf = float(fila[2]) if fila.shape[0] >= 3 else 1.0
+    if conf < umbral:
+        return None
+    return int(round(x)), int(round(y))
+
+
+def _color_hueso(a: int, b: int):
+    izq = {HOMBRO_IZQ, CODO_IZQ, MUNECA_IZQ, CADERA_IZQ}
+    der = {HOMBRO_DER, CODO_DER, MUNECA_DER, CADERA_DER}
+    if a in izq or b in izq:
+        return COLOR_POSE_IZQ
+    if a in der or b in der:
+        return COLOR_POSE_DER
+    return COLOR_POSE_TORSO
+
+
+def dibujar_pose(frame: np.ndarray, contexto: ContextoEscena, umbral: float = 0.3) -> None:
+    """Pinta el esqueleto YOLO de la cintura hacia arriba, con brazos, muñecas y palmas."""
+    import cv2
+
+    for persona in contexto.personas:
+        kp = persona.keypoints
+        if kp is None or len(kp) == 0:
+            continue
+        for a, b in POSE_HUESOS:
+            pa, pb = _xy_keypoint(kp, a, umbral), _xy_keypoint(kp, b, umbral)
+            if pa is None or pb is None:
+                continue
+            cv2.line(frame, pa, pb, _color_hueso(a, b), 2, cv2.LINE_AA)
+        for indice in POSE_NOMBRES:
+            punto = _xy_keypoint(kp, indice, umbral)
+            if punto is None:
+                continue
+            cv2.circle(frame, punto, 5, _color_hueso(indice, indice), -1, cv2.LINE_AA)
+    for mano in contexto.manos:
+        palma = mano.palma or mano.punto
+        px, py = int(round(palma[0])), int(round(palma[1]))
+        wx, wy = int(round(mano.punto[0])), int(round(mano.punto[1]))
+        cv2.line(frame, (wx, wy), (px, py), COLOR_PALMA, 2, cv2.LINE_AA)
+        cv2.circle(frame, (px, py), 6, COLOR_PALMA, -1, cv2.LINE_AA)
 
 
 class AnalizadorEscena:

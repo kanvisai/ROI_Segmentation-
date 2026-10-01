@@ -161,12 +161,18 @@ def publicar_comparativa(
     destino.mkdir(parents=True, exist_ok=True)
     csv_path = destino / "comparativa.csv"
     filas = leer_comparativa(csv_path)
-    filas = [
+    previas = [
         item
         for item in filas
-        if (item.get("clip"), item.get("backend")) != (clip, backend)
+        if (item.get("clip"), item.get("backend")) == (clip, backend)
     ]
-    filas.append({campo: fila.get(campo, "") for campo in CAMPOS})
+    filas = [item for item in filas if item not in previas]
+    # Columnas añadidas a mano al CSV (revisión, notas): la fila nueva las hereda.
+    for previa in previas:
+        for campo, valor in previa.items():
+            if campo not in CAMPOS:
+                fila.setdefault(campo, valor)
+    filas.append(fila)
     return volcar_comparativa(destino, filas)
 
 
@@ -186,11 +192,16 @@ def leer_comparativa(csv_path: Path) -> list[dict]:
 def volcar_comparativa(destino: Path, filas: list[dict]) -> Path:
     """Escribe comparativa.csv, .json y .md con las filas dadas, ordenadas por clip."""
     destino.mkdir(parents=True, exist_ok=True)
-    filas = [{campo: item.get(campo, "") for campo in CAMPOS} for item in filas]
+    columnas = list(CAMPOS)
+    for item in filas:
+        for campo in item:
+            if campo not in columnas:
+                columnas.append(campo)
+    filas = [{campo: item.get(campo, "") for campo in columnas} for item in filas]
     filas.sort(key=lambda item: (item.get("clip") or "", item.get("backend") or ""))
     csv_path = destino / "comparativa.csv"
     with csv_path.open("w", encoding="utf-8", newline="") as fichero:
-        escritor = csv.DictWriter(fichero, fieldnames=CAMPOS)
+        escritor = csv.DictWriter(fichero, fieldnames=columnas)
         escritor.writeheader()
         escritor.writerows(filas)
     (destino / "comparativa.json").write_text(
@@ -201,12 +212,12 @@ def volcar_comparativa(destino: Path, filas: list[dict]) -> Path:
         "",
         "Una fila por clip y tecnología.",
         "",
-        "| " + " | ".join(CAMPOS) + " |",
-        "|" + "|".join("---" for _ in CAMPOS) + "|",
+        "| " + " | ".join(columnas) + " |",
+        "|" + "|".join("---" for _ in columnas) + "|",
     ]
     for item in filas:
         celdas = []
-        for campo in CAMPOS:
+        for campo in columnas:
             valor = item.get(campo, "")
             if campo == "ok":
                 valor = "si" if str(valor) in ("True", "true", "si") else "NO"

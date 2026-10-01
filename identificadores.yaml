@@ -1,0 +1,73 @@
+# Identificadores de escena: se detectan en el frame completo, sin esperar a la mano.
+# Pon activo: false para apagar una clase sin tocar el código.
+#
+# Si la clase existe en COCO, se usa el id de Ultralytics y su nombre:
+#   https://docs.ultralytics.com/datasets/detect/coco/
+#   24: backpack
+#   26: handbag
+#   28: suitcase
+#   39: bottle
+#   66: keyboard
+#   67: cell phone
+# El móvil es 67 en Ultralytics (el 66 es keyboard). El detector resuelve por
+# `nombre`, así que aunque el id cambie de versión se sigue encontrando.
+#
+# Las que no están en COCO (carrito, cesto, bolsa) se preguntan por texto a YOLOE.
+#
+# destino: true  → el objeto de la mano puede acabar dentro (carrito, cesto, bolso…).
+# accesorio: true → bolso al hombro / mochila: no se confunden con el objeto agarrado.
+
+identificadores:
+  carrito:
+    activo: true
+    destino: true
+    accesorio: false
+    prompts:
+      - shopping cart
+      - shopping trolley
+
+  cesto:
+    activo: true
+    destino: true
+    accesorio: false
+    prompts:
+      - shopping basket
+      - basket
+
+  bolso:
+    activo: true
+    ultralytics_id: 26
+    nombre: handbag
+    destino: true
+    accesorio: true
+    prompts:
+      - handbag
+      - purse
+
+  mochila:
+    activo: true
+    ultralytics_id: 24
+    nombre: backpack
+    destino: true
+    accesorio: true
+    prompts:
+      - backpack
+
+  bolsa:
+    activo: true
+    destino: true
+    accesorio: false
+    prompts:
+      - plastic bag
+      - shopping bag
+      - paper bag
+
+  celular:
+    activo: true
+    ultralytics_id: 67
+    nombre: cell phone
+    destino: false
+    accesorio: false
+    prompts:
+      - cell phone
+      - mobile phone

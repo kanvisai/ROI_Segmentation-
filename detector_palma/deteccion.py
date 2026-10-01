@@ -130,6 +130,33 @@ class DetectorUltralytics:
                     extras.append(inst)
         return extras
 
+    def detectar_clases(
+        self, frame: np.ndarray, clases: list[int], conf: float | None = None
+    ) -> list[Instancia]:
+        """Una pasada de frame completo limitada a las clases COCO pedidas."""
+        if not clases:
+            return []
+        alto, ancho = frame.shape[:2]
+        comunes = self._comunes(conf)
+        comunes["classes"] = [int(c) for c in clases]
+        resultados = self.modelo.predict(frame, **comunes)
+        if not resultados:
+            return []
+        return self._convertir(resultados[0], ancho, alto)
+
+    def detectar_en_caja(
+        self, frame: np.ndarray, caja, conf: float | None = None
+    ) -> list[Instancia]:
+        """Una pasada solo dentro de la caja, con las mascaras ya reproyectadas al frame."""
+        return self._inferir_recorte(frame, caja, self.conf if conf is None else conf)
+
+    def reproyectar_desde_recorte(
+        self, inst: Instancia, caja, ancho: int, alto: int
+    ) -> Instancia | None:
+        """Lleva una mascara obtenida en un recorte a coordenadas del frame completo."""
+        x1, y1, x2, y2 = caja
+        return self._reproyectar(inst, x1, y1, x2, y2, ancho, alto)
+
     def _inferir_recorte(
         self, frame: np.ndarray, caja, conf: float
     ) -> list[Instancia]:
@@ -305,6 +332,7 @@ class DetectorUltralytics:
                     score=score,
                     id_backend=id_backend,
                     es_persona=etiqueta in self.clases_excluidas,
+                    extra={"clase_id": clase_id},
                 )
             )
         return instancias

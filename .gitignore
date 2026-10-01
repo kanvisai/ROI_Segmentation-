@@ -1,5 +1,6 @@
 # Vídeos privados: no deben subirse al repositorio.
 videos/
+videos*/
 
 # Antiguo proyecto: no deben subirse al repositorio.
 antiguo_proyecto/
@@ -20,8 +21,10 @@ __pycache__/
 # Checkpoints descargados dentro del proyecto.
 checkpoints/
 
-# Pesos locales de YOLO y MobileSAM.
+# Pesos locales de YOLO, YOLOE, MobileSAM y el encoder de texto de YOLOE.
 pesos/*.pt
+pesos/*.ts
+mobileclip2_b.ts
 
 # Código y pesos de terceros (HOIST-Former).
 third_party/

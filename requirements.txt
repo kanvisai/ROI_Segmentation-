@@ -11,3 +11,4 @@ setuptools
 tqdm
 Pillow
 ultralytics
+pyyaml
