@@ -12,3 +12,4 @@ tqdm
 Pillow
 ultralytics
 pyyaml
+mediapipe>=0.10.14

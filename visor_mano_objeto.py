@@ -256,23 +256,23 @@ def seguir(frames, cajas_persona, predictor, padding, roi_min, dilatacion, ancho
 
 def resumen(video: Path, eventos, ultima, nframes: int, muestreo: dict | None = None) -> str:
     lineas = [
-        f"Vídeo: {video}",
-        f"Frames procesados: {nframes}",
-        "Modelo: VISOR-HOS (EPIC-KITCHENS). Mano, contacto y objeto asociado.",
-        "Entrenado con vídeo egocéntrico de cocina.",
+        f"Video: {video}",
+        f"Processed frames: {nframes}",
+        "Model: VISOR-HOS (EPIC-KITCHENS). Hand, contact and associated object.",
+        "Trained on egocentric kitchen video.",
         (muestreo or {}).get(
-            "descripcion",
-            "No se ha especificado --fps. El procesamiento ha sido de frame a frame.",
+            "description",
+            "--fps was not set. Processing ran frame by frame.",
         ),
         "",
     ]
     if not eventos and ultima is None:
-        lineas.append("VISOR no dejó ningún objeto en contacto dentro del ROI.")
+        lineas.append("VISOR left no object in contact inside the ROI.")
         return "\n".join(lineas) + "\n"
     lineas.extend(describir_eventos(eventos, ultima))
     lineas.append(
-        "\nIzquierda y derecha salen de la cabeza de lateralidad de VISOR. "
-        "En contacto significa que el modelo une esa mano con el objeto."
+        "\nLeft and right come from the VISOR laterality head. "
+        "In contact means the model links that hand with the object."
     )
     return "\n".join(lineas) + "\n"
 
@@ -313,7 +313,7 @@ def procesar(predictor, video: Path, args, salida: Path) -> None:
         nframes_origen = min(nframes_origen, args.max_frames)
     muestreo = describir_muestreo(args.fps, fps, nframes_origen, len(frames))
     print(f"\n=== {video.name}: {ancho}x{alto}, {len(frames)} frames procesados, {fps:.3f} fps ===")
-    print(f"  {muestreo['descripcion']}")
+    print(f"  {muestreo['description']}")
     destino = carpeta_de(salida, "visor", video)
     medidor = Medidor("visor")
     try:
@@ -354,26 +354,26 @@ def _procesar(predictor, video, args, destino, medidor, frames, fps, ancho, alto
     )
     informe = {
         "video": str(video),
-        "modelo": "VISOR-HOS",
-        "ancho": ancho,
-        "alto": alto,
+        "model": "VISOR-HOS",
+        "width": ancho,
+        "height": alto,
         "frames": len(frames),
         "fps": fps,
-        "fps_salida": fps_salida,
-        "muestreo": muestreo,
-        "indices_origen": indices_origen,
-        "padding_roi": args.padding,
-        "persona_de_frente": not args.de_espaldas,
-        "ids_objeto": sorted({d.id_sam3 for d in cadena.detecciones}) if cadena else [],
-        "eventos": eventos,
-        "linea_temporal": frames_json,
+        "output_fps": fps_salida,
+        "sampling": muestreo,
+        "source_indices": indices_origen,
+        "roi_padding": args.padding,
+        "person_facing_camera": not args.de_espaldas,
+        "object_ids": sorted({d.id_sam3 for d in cadena.detecciones}) if cadena else [],
+        "events": eventos,
+        "timeline": frames_json,
     }
-    (destino / "seguimiento.json").write_text(
+    (destino / "tracking.json").write_text(
         json.dumps(informe, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     texto = resumen(video, eventos, ultima, len(frames), muestreo)
-    (destino / "resumen.txt").write_text(texto, encoding="utf-8")
-    (destino / "metricas.json").write_text(
+    (destino / "summary.txt").write_text(texto, encoding="utf-8")
+    (destino / "metrics.json").write_text(
         json.dumps(metricas, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     frames_con_objeto = sum(1 for frame in frames_json if frame["objeto"]["visible"])

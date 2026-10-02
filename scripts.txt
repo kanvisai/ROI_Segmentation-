@@ -7,11 +7,14 @@ python hoist_mano_objeto.py --videos videos --salida salidas
 
 
 - python sam3_mano_objeto.py --videos videos --identificadores identificadores.yaml --salida salidas
-python yolo26_mano_objeto.py --videos videos --identificadores identificadores.yaml --salida salidas
-python track_anything_mano_objeto.py --videos videos --identificadores identificadores.yaml --salida salidas
+- python yolo26_mano_objeto.py --videos videos --identificadores identificadores.yaml --salida salidas
+- python track_anything_mano_objeto.py --videos videos --identificadores identificadores.yaml --salida salidas
 - python cutie_mano_objeto.py --videos videos --identificadores identificadores.yaml --salida salidas
 - python hoist_mano_objeto.py --videos videos --identificadores identificadores.yaml --salida salidas
 
 
 python sam3_mano_objeto.py --video videos/3_clip_2.mp4 --identificadores identificadores.yaml --salida salidas
 
+python sam3_mano_objeto.py --video videos/3_clip_3.mp4 --identificadores identificadores.yaml --fps 2 --salida salidas
+
+.venv/bin/python yolo26_mano_objeto.py --video videos/3_clip_3.mp4 --mediapipe --salida salidas

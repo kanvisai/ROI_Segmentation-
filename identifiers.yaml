@@ -1,0 +1,82 @@
+# Scene identifiers: detected on the full frame, without waiting for a hand.
+# Set active: false to disable a class without changing code.
+#
+# If the class exists in COCO, use the Ultralytics id and its English name:
+#   https://docs.ultralytics.com/datasets/detect/coco/
+#   24: backpack
+#   26: handbag
+#   28: suitcase
+#   39: bottle
+#   66: keyboard
+#   67: cell phone
+# The phone is 67 in Ultralytics (66 is keyboard). The detector resolves by
+# `name`, so a renamed id still matches.
+#
+# Classes missing from COCO (carrito, cesto, bolsa) are queried by text with YOLOE.
+# Category keys (carrito, cesto, …) are stable ids used in tracking.json
+# (e.g. cesto_2). Do not rename them if downstream code depends on those ids.
+#
+# destination: true  → the handheld object may end inside this ROI.
+# accessory: true    → shoulder bag / backpack: do not treat as the grasped object.
+#
+# hands.min_confidence: wrist/hand visibility threshold. Below this value the
+# object model is not applied on that frame. If no wrist is ever visible,
+# final_state is "no_hands".
+
+hands:
+  min_confidence: 0.20
+
+identifiers:
+  carrito:
+    active: true
+    destination: true
+    accessory: false
+    prompts:
+      - shopping cart
+      - shopping trolley
+
+  cesto:
+    active: true
+    destination: true
+    accessory: false
+    prompts:
+      - shopping basket
+      - basket
+
+  bolso:
+    active: true
+    ultralytics_id: 26
+    name: handbag
+    destination: true
+    accessory: true
+    prompts:
+      - handbag
+      - purse
+
+  mochila:
+    active: true
+    ultralytics_id: 24
+    name: backpack
+    destination: true
+    accessory: true
+    prompts:
+      - backpack
+
+  bolsa:
+    active: true
+    destination: true
+    accessory: false
+    prompts:
+      - plastic bag
+      - shopping bag
+      - paper bag
+
+  celular:
+    active: true
+    ultralytics_id: 67
+    name: cell phone
+    destination: false
+    accessory: false
+    prompts:
+      - cell phone
+      - mobile phone

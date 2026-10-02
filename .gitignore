@@ -24,6 +24,7 @@ checkpoints/
 # Pesos locales de YOLO, YOLOE, MobileSAM y el encoder de texto de YOLOE.
 pesos/*.pt
 pesos/*.ts
+pesos/*.task
 mobileclip2_b.ts
 
 # Código y pesos de terceros (HOIST-Former).

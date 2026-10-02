@@ -42,10 +42,10 @@ from pipeline_manos import (
 2. Recorta una ventana alrededor de cada palma (`--padding-muneca`, `--crop-min`).
 3. Dentro de ese recorte busca el objeto (YOLO26n-seg + MobileSAM opcional).
 4. Puntúa agarre contra las dos manos (`izquierda` / `derecha` / `ambas`).
-5. Detecta identificadores de escena en el **frame completo** según `identificadores.yaml` (YOLO cerrado + YOLOE open-vocab).
-6. El backend **sigue o redetecta** la máscara del objeto.
-7. Decide si el último ROI acaba dentro de un contenedor (`acaba_en_contenedor`).
-8. Escribe vídeo anotado, JSON, resumen, métricas y una fila en la comparativa.
+5. Detecta identificadores de escena en el **frame completo** según `identifiers.yaml` (YOLO cerrado + YOLOE open-vocab).
+6. El backend **sigue o redetecta** la máscara del objeto. Si las muñecas no superan `hands.min_confidence`, ese frame no ejecuta el modelo de objeto.
+7. El último frame visible decide si el objeto acaba dentro de un contenedor (`ends_in_container`, `final_container`).
+8. Escribe vídeo anotado, `tracking.json`, `summary.txt`, `metrics.json` y una fila en la comparativa. Si nunca hay muñecas, `final_state` es `no_hands`.
 
 Cutie y Track-Anything **propagan** la semilla. YOLO26-seg, SAM 3 y HOIST **redetectan** cada frame (`seguir_por_deteccion`). VISOR no usa este pipeline: corre su propio HOS + Faster R-CNN.
 
@@ -57,7 +57,8 @@ Cutie y Track-Anything **propagan** la semilla. YOLO26-seg, SAM 3 y HOIST **rede
 ROI_Segmentation-/
 ├── pipeline_manos.py              # Hub: detección, YAML, muestreo --fps, JSON, vídeo
 ├── salida_comun.py                # Carpetas, Medidor RAM/VRAM, comparativa.csv/.md/.json
-├── identificadores.yaml           # Catálogo activable de escena (carrito, cesto, …)
+├── identifiers.yaml               # Catálogo de escena + hands.min_confidence (inglés)
+├── identificadores.yaml           # Copia de compatibilidad para --identificadores antiguo
 ├── detector_palma/                # Pose, recorte, YOLO-seg, MobileSAM, score de agarre
 │   ├── personas.py                # AnalizadorEscena (YOLO-pose), dibujar_pose cintura↑
 │   ├── deteccion.py               # DetectorUltralytics, GeneradorMascarasSAM
@@ -106,7 +107,7 @@ seguir_contenedores()
 descartar_accesorios / quedarse_con_agarrados / descartar_contenedores_en_mano
         |
         v
-escribir_salidas() → anotado.mp4, frames/, seguimiento.json, resumen.txt, metricas.json
+escribir_salidas() → anotado.mp4, frames/, tracking.json, summary.txt, metrics.json
 publicar_comparativa() → salidas/comparativa/
 ```
 
@@ -310,13 +311,15 @@ Todos salvo VISOR llaman a `anadir_argumentos_comunes`. VISOR replica `--videos`
 | `--videos` | `videos` | Carpeta de clips. |
 | `--video` | ninguno | Un solo archivo; ignora `--videos`. |
 | `--salida` | `salidas` | Raíz de resultados. |
-| `--identificadores` | `identificadores.yaml` | Catálogo de escena. |
+| `--identificadores` | `identifiers.yaml` | Catálogo de escena + `hands.min_confidence`. |
+| `--mediapipe` | off | Esqueleto MediaPipe (Pose + Hands) en lugar de YOLO-pose. |
 | `--fps N` | omitido = frame a frame | Ver [Muestreo `--fps`](#muestreo---fps). |
 | `--max-frames` | ninguno | Corta la lectura del vídeo de origen (antes del muestreo). |
 | `--sin-sam` | off | No usa MobileSAM. |
 | `--sin-contenedores` | off | Ignora el YAML. |
 | `--sin-frames` | off | No vuelca JPEG sueltos. |
 | `--sin-pose` | off | No pinta el esqueleto (cintura, brazos, muñecas, palmas; sin piernas ni abanico de dedos ni textos). |
+| `--mediapipe` | off | MediaPipe Pose + Hands instead of YOLO-pose. More reliable empty-hand rejection. Wrist visibility uses `hands.min_confidence` (default 0.20). |
 
 ### Detección de palma
 
@@ -373,41 +376,45 @@ Si `--fps` se omite, o si `N >= rate`, el procesamiento es **frame a frame**.
 
 El seguimiento interno usa índices 0…M−1 de los frames **procesados**. JSON, HUD y nombres `frames/frame_XXXXX.jpg` se remapean al índice **original** del archivo (`t = orig / fps_video`). El `anotado.mp4` se escribe a `N` fps cuando hay muestreo, para conservar la duración.
 
-Consola, `resumen.txt` y `seguimiento.json["muestreo"]` declaran siempre una de estas tres:
+Consola, `summary.txt` y `tracking.json["sampling"]` declaran siempre una de estas tres:
 
-- `No se ha especificado --fps. El procesamiento ha sido de frame a frame.`
-- `Se ha establecido --fps N. El vídeo va a … (rate R): de cada segundo se procesan los frames …`
-- `Se ha establecido --fps N, igual o mayor que el rate del vídeo (R fps). El procesamiento ha sido de frame a frame.`
+- `--fps was not set. Processing ran frame by frame.`
+- `--fps N was set. The video is … (rate R): each second uses frames …`
+- `--fps N was set, equal to or greater than the video rate (R fps). Processing ran frame by frame.`
 
 `--max-frames` limita frames de **origen** leídos, y después se aplica el muestreo.
 
 ---
 
-## Identificadores de escena (`identificadores.yaml`)
+## Scene identifiers (`identifiers.yaml`)
 
-Detección **inmediata en todo el frame**, no espera a la mano. Estructura:
+Immediate detection on the **full frame**. Keys and comments are in English. Category ids (`carrito`, `cesto`, …) stay stable so `cesto_2` does not change.
 
 ```yaml
-identificadores:
+hands:
+  min_confidence: 0.20
+
+identifiers:
   celular:
-    activo: true
+    active: true
     ultralytics_id: 67
-    nombre: cell phone
-    destino: false
-    accesorio: false
+    name: cell phone
+    destination: false
+    accessory: false
     prompts:
       - cell phone
       - mobile phone
 ```
 
-| Campo | Efecto |
+| Field | Effect |
 |---|---|
-| `activo` | `false` apaga la clase sin tocar código. |
-| `ultralytics_id` | Atajo COCO. El detector **resuelve por `nombre`** contra `model.names`. |
-| `nombre` | Nombre Ultralytics (inglés). |
-| `prompts` | Texto para YOLOE (inglés). Obligatorio si la clase no está en COCO. |
-| `destino` | El objeto de la mano puede acabar dentro (se pinta en verde). |
-| `accesorio` | Bolso al hombro / mochila: no se fusiona con el objeto de la palma. |
+| `active` | `false` disables the class. |
+| `ultralytics_id` | COCO shortcut. The detector resolves by `name`. |
+| `name` | Ultralytics English name. |
+| `prompts` | YOLOE text. Required if the class is not in COCO. |
+| `destination` | The handheld object may end inside this ROI (green). |
+| `accessory` | Shoulder bag / backpack: not merged with the grasped object. |
+| `hands.min_confidence` | Below this, wrists/hands are treated as not visible and the object model is skipped. |
 
 Ids Ultralytics COCO (contiguos 0–79), no los ids “paper” de COCO: `24` backpack, `26` handbag, `66` **keyboard**, `67` **cell phone**. El móvil es **67**. Carrito, cesto y bolsa no están en COCO: solo YOLOE.
 
@@ -423,42 +430,42 @@ Por clip y tecnología, en `salidas/<tecnologia>/<stem>/`:
 |---|---|
 | `anotado.mp4` | Máscaras de objeto, caja + etiqueta de mano (`IZQ`/`DER`/`AMBAS`), ROI de identificadores, esqueleto cintura↑, HUD `frame <origen> t=…`. |
 | `frames/frame_XXXXX.jpg` | Mismo overlay; `XXXXX` es el índice original. `--sin-frames` lo omite. |
-| `seguimiento.json` | Traza completa (esquema abajo). |
-| `resumen.txt` | Los mismos eventos en texto, más la frase de `--fps`. |
-| `metricas.json` | `frames_procesados`, `fps_medio`, `ms_por_frame`, picos RAM/VRAM, CPU, etapas (`segmentacion`). |
+| `tracking.json` | Full trace (schema below). |
+| `summary.txt` | Same events in English, plus the `--fps` sentence. |
+| `metrics.json` | `processed_frames`, `mean_fps`, `ms_per_frame`, RAM/VRAM peaks, CPU, `stages`. |
 
-### `seguimiento.json` (pipeline común)
+### `tracking.json` (shared pipeline)
 
-Campos de cabecera: `video`, `modelo`, `ancho`, `alto`, `frames` (procesados), `frames_origen`, `fps` (del archivo), `fps_salida`, `muestreo`, `parametros`, `identificadores_yaml`.
+Header: `video`, `model`, `width`, `height`, `frames`, `source_frames`, `fps`, `output_fps`, `sampling`, `pose_backend`, `hands_visible`, `final_state`, `parameters`, `identifiers_yaml`.
 
-`muestreo`:
+`sampling`:
 
 ```json
 {
-  "especificado": true,
-  "fps_parametro": 2,
-  "fps_video": 15.0,
-  "rate_entero": 15,
-  "frames_origen": 150,
-  "frames_procesados": 20,
-  "offsets_en_segundo": [0, 7],
-  "descripcion": "Se ha establecido --fps 2. …"
+  "specified": true,
+  "fps_parameter": 2,
+  "video_fps": 15.0,
+  "integer_rate": 15,
+  "source_frames": 150,
+  "processed_frames": 20,
+  "offsets_in_second": [0, 7],
+  "description": "--fps 2 was set. …"
 }
 ```
 
-`contenedores[]`: `id`, `categoria`, `prompt`, scores, `primer_frame` / `ultimo_frame` (origen), `frames_visto`, `destino`, `accesorio`, `roi_ultimo`, `rois` mapa frame→`[x1,y1,x2,y2]`.
+`containers[]`: `id`, `category`, `prompt`, scores, `first_frame` / `last_frame` (source), `frames_seen`, `destination`, `accessory`, `last_roi`, `rois` frame→`[x1,y1,x2,y2]`.
 
-`objetos[]`:
+`objects[]`:
 
-- `id`, `frames_visible`, `frames_en_mano`, `primer_frame`, `ultimo_frame`, `resiembras`
-- `manos`: `{izquierda, derecha, ambas, sin_mano}`
-- `mano_predominante`
-- `ultimo_roi`, `ultimo_centro`, `ultimo_frame_visible`
-- `estado_final`: `en_mano` \| `suelto` \| `desaparecido` \| `dentro_de_contenedor` \| `sin_datos`
-- `acaba_en_contenedor` (bool)
-- `contenedor_final`: `{id, categoria, roi, fraccion_dentro}` o `null`
-- `eventos[]`: `aparece`, `desaparece`, `reaparece`, `suelta`, `reagarre`, `cambio_de_mano` (`desde`/`hasta`). Cada uno lleva `frame` (origen), `frame_procesado`, `t`, `mano`, `centro`, `roi`.
-- `linea_temporal[]`: un registro por frame visible con `frame`, `frame_procesado`, `t`, `mano`, `roi`, `centro`, `area`, `score_agarre`, `scores_mano`, `origen` (`deteccion` \| `propagacion`).
+- `id`, `frames_visible`, `frames_in_hand`, `first_frame`, `last_frame`, `reseeds`
+- `hands`: `{left, right, both, no_hand}`
+- `dominant_hand`
+- `last_roi`, `last_center`, `last_visible_frame`
+- `final_state`: `in_hand` \| `released` \| `disappeared` \| `inside_container` \| `no_data` \| `no_hands`
+- `ends_in_container` (bool)
+- `final_container`: `{id, category, roi, fraction_inside, center_inside}` or `null`
+- `events[]`: `appears`, `disappears`, `reappears`, `releases`, `regrasps`, `hand_change` (`from`/`to`)
+- `timeline[]`: `frame`, `processed_frame`, `t`, `hand`, `roi`, `center`, `area`, `grip_score`, `hand_scores`, `origin` (`detection` \| `propagation`)
 
 VISOR escribe un JSON distinto (`eventos`, `linea_temporal` estilo SAM 3 original) más el bloque `muestreo`.
 
@@ -489,14 +496,14 @@ procesar_video(
     backend="MiBackend",       # columna comparativa
     modelo="MiBackend …",      # campo JSON / resumen
     seguir=seguir,
-    extra={"propagador": "…"}, # se fusiona en seguimiento.json
+    extra={"propagator": "…"}, # merged into tracking.json
 )
 ```
 
-6. No tocar el esquema de `objetos[]` / `contenedores[]` si el consumidor ya parsea el JSON actual.
+6. Do not change the `objects[]` / `containers[]` schema if a consumer already parses `tracking.json`.
 7. Documentar pesos y `third_party/` en este README.
 
-Para un servicio que solo quiera ROI final + contenedor, leer `seguimiento.json` → `objetos[i].ultimo_roi`, `acaba_en_contenedor`, `contenedor_final`. No hace falta el vídeo anotado (`--sin-frames`).
+Para un servicio que solo quiera ROI final + contenedor, leer `tracking.json` → `objects[i].last_roi`, `ends_in_container`, `final_container`. No hace falta el vídeo anotado (`--sin-frames`).
 
 Importar detección suelta (sin `procesar_video`):
 

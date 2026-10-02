@@ -105,20 +105,20 @@ class Medidor:
             if not valores:
                 continue
             etapas[nombre] = {
-                "llamadas": len(valores),
-                "media_ms": round(1000 * sum(valores) / len(valores), 2),
+                "calls": len(valores),
+                "mean_ms": round(1000 * sum(valores) / len(valores), 2),
                 "total_s": round(sum(valores), 3),
             }
         return {
             "backend": self.backend,
-            "frames_procesados": frames,
-            "duracion_total_s": round(duracion, 3),
-            "fps_medio": round(frames / duracion, 2) if frames else 0.0,
-            "ms_por_frame": round(1000 * duracion / frames, 2) if frames else None,
-            "ram_proceso_pico_mb": round(self._ram_pico / (1024 * 1024), 1),
-            "vram_pico_mb": round(vram, 1),
-            "cpu_medio_pct": round(cpu, 1),
-            "etapas": etapas,
+            "processed_frames": frames,
+            "total_duration_s": round(duracion, 3),
+            "mean_fps": round(frames / duracion, 2) if frames else 0.0,
+            "ms_per_frame": round(1000 * duracion / frames, 2) if frames else None,
+            "peak_ram_mb": round(self._ram_pico / (1024 * 1024), 1),
+            "peak_vram_mb": round(vram, 1),
+            "mean_cpu_pct": round(cpu, 1),
+            "stages": etapas,
         }
 
 
@@ -138,18 +138,18 @@ def publicar_comparativa(
 ) -> Path:
     """Actualiza la fila de este clip y esta tecnología en salidas/comparativa/."""
     metricas = metricas or {}
-    seg = (metricas.get("etapas") or {}).get("segmentacion") or {}
+    seg = (metricas.get("stages") or metricas.get("etapas") or {}).get("segmentacion") or {}
     fila = {
         "clip": clip,
         "backend": backend,
         "ok": ok,
-        "frames": metricas.get("frames_procesados", ""),
-        "fps": metricas.get("fps_medio", ""),
-        "ms_frame": metricas.get("ms_por_frame", ""),
-        "ms_segmentacion": seg.get("media_ms", ""),
-        "ram_pico_mb": metricas.get("ram_proceso_pico_mb", ""),
-        "vram_pico_mb": metricas.get("vram_pico_mb", ""),
-        "cpu_pct": metricas.get("cpu_medio_pct", ""),
+        "frames": metricas.get("processed_frames", metricas.get("frames_procesados", "")),
+        "fps": metricas.get("mean_fps", metricas.get("fps_medio", "")),
+        "ms_frame": metricas.get("ms_per_frame", metricas.get("ms_por_frame", "")),
+        "ms_segmentacion": seg.get("mean_ms", seg.get("media_ms", "")),
+        "ram_pico_mb": metricas.get("peak_ram_mb", metricas.get("ram_proceso_pico_mb", "")),
+        "vram_pico_mb": metricas.get("peak_vram_mb", metricas.get("vram_pico_mb", "")),
+        "cpu_pct": metricas.get("mean_cpu_pct", metricas.get("cpu_medio_pct", "")),
         "objetos": objetos,
         "desapariciones": desapariciones,
         "frames_con_objeto": frames_con_objeto,
@@ -208,9 +208,9 @@ def volcar_comparativa(destino: Path, filas: list[dict]) -> Path:
         json.dumps(filas, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     lineas = [
-        "# Comparativa",
+        "# Comparison",
         "",
-        "Una fila por clip y tecnología.",
+        "One row per clip and technology.",
         "",
         "| " + " | ".join(columnas) + " |",
         "|" + "|".join("---" for _ in columnas) + "|",

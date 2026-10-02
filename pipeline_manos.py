@@ -36,7 +36,34 @@ from salida_comun import Medidor, carpeta_de, publicar_comparativa
 RAIZ = Path(__file__).resolve().parent
 PESOS = RAIZ / "pesos"
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
-YAML_IDENTIFICADORES = RAIZ / "identificadores.yaml"
+YAML_IDENTIFICADORES = (
+    RAIZ / "identifiers.yaml" if (RAIZ / "identifiers.yaml").is_file()
+    else RAIZ / "identificadores.yaml"
+)
+
+MANO_EN = {"izquierda": "left", "derecha": "right", "ambas": "both", "sin_mano": "no_hand"}
+ESTADO_EN = {
+    "en_mano": "in_hand",
+    "suelto": "released",
+    "desaparecido": "disappeared",
+    "dentro_de_contenedor": "inside_container",
+    "sin_datos": "no_data",
+    "sin_manos": "no_hands",
+}
+EVENTO_EN = {
+    "aparece": "appears",
+    "desaparece": "disappears",
+    "reaparece": "reappears",
+    "suelta": "releases",
+    "reagarre": "regrasps",
+    "cambio_de_mano": "hand_change",
+}
+
+
+def _mano_en(valor):
+    if valor is None:
+        return None
+    return MANO_EN.get(valor, valor)
 COLOR_OBJETO = [
     (255, 0, 255),
     (0, 255, 255),
@@ -61,35 +88,47 @@ class Identificador:
     accesorio: bool = False
 
 
-def cargar_catalogo(ruta: Path) -> list[Identificador]:
-    """Lee identificadores.yaml. ``activo: false`` apaga esa detección inmediata."""
+@dataclass
+class ConfigManos:
+    """Umbral de visibilidad de muñecas / manos leído del YAML."""
+
+    min_confidence: float = 0.20
+
+
+def cargar_catalogo(ruta: Path) -> tuple[list[Identificador], ConfigManos]:
+    """Lee identifiers.yaml (o identificadores.yaml). Acepta claves en inglés o español."""
     if not ruta.is_file():
-        raise SystemExit(f"No existe el YAML de identificadores {ruta}")
+        raise SystemExit(f"Missing identifiers YAML {ruta}")
     datos = yaml.safe_load(ruta.read_text(encoding="utf-8")) or {}
-    bloque = datos.get("identificadores")
+    bloque = datos.get("identifiers") or datos.get("identificadores")
     if not isinstance(bloque, dict) or not bloque:
-        raise SystemExit(f"{ruta} no tiene el mapa ``identificadores``.")
+        raise SystemExit(f"{ruta} has no ``identifiers`` map.")
+    manos_raw = datos.get("hands") or datos.get("manos") or {}
+    if not isinstance(manos_raw, dict):
+        manos_raw = {}
+    min_conf = manos_raw.get("min_confidence", manos_raw.get("min_confianza", 0.20))
+    config_manos = ConfigManos(min_confidence=float(min_conf))
     catalogo: list[Identificador] = []
     for clave, raw in bloque.items():
         if not isinstance(raw, dict):
-            raise SystemExit(f"La entrada «{clave}» de {ruta} no es un mapa.")
+            raise SystemExit(f"Entry «{clave}» in {ruta} is not a map.")
         uid = raw.get("ultralytics_id")
         prompts = [str(p).strip() for p in (raw.get("prompts") or []) if str(p).strip()]
-        nombre = raw.get("nombre")
+        nombre = raw.get("name", raw.get("nombre"))
         if nombre is not None:
             nombre = str(nombre).strip() or None
         catalogo.append(
             Identificador(
                 clave=str(clave),
-                activo=bool(raw.get("activo", True)),
+                activo=bool(raw.get("active", raw.get("activo", True))),
                 ultralytics_id=int(uid) if uid is not None and uid != "" else None,
                 nombre=nombre,
                 prompts=prompts,
-                destino=bool(raw.get("destino", False)),
-                accesorio=bool(raw.get("accesorio", False)),
+                destino=bool(raw.get("destination", raw.get("destino", False))),
+                accesorio=bool(raw.get("accessory", raw.get("accesorio", False))),
             )
         )
-    return catalogo
+    return catalogo, config_manos
 
 
 def _id_ultralytics(nombres: dict, ident: Identificador) -> int | None:
@@ -182,45 +221,45 @@ def describir_muestreo(fps_proceso, fps_video: float, n_origen: int, n_procesado
     """Texto y metadatos de si --fps se usó o el análisis fue frame a frame."""
     offsets, rate = offsets_muestreo(fps_video, fps_proceso)
     base = {
-        "fps_video": round(float(fps_video), 4),
-        "rate_entero": rate,
-        "frames_origen": n_origen,
-        "frames_procesados": n_procesados,
+        "video_fps": round(float(fps_video), 4),
+        "integer_rate": rate,
+        "source_frames": n_origen,
+        "processed_frames": n_procesados,
     }
     if fps_proceso is None:
         return {
             **base,
-            "especificado": False,
-            "fps_parametro": None,
-            "descripcion": (
-                "No se ha especificado --fps. El procesamiento ha sido de frame a frame."
+            "specified": False,
+            "fps_parameter": None,
+            "description": (
+                "--fps was not set. Processing ran frame by frame."
             ),
         }
     if offsets is None:
         return {
             **base,
-            "especificado": True,
-            "fps_parametro": int(fps_proceso),
-            "descripcion": (
-                f"Se ha establecido --fps {int(fps_proceso)}, igual o mayor que el rate "
-                f"del vídeo ({rate} fps). El procesamiento ha sido de frame a frame."
+            "specified": True,
+            "fps_parameter": int(fps_proceso),
+            "description": (
+                f"--fps {int(fps_proceso)} was set, equal to or greater than the video "
+                f"rate ({rate} fps). Processing ran frame by frame."
             ),
         }
     ejemplo = ", ".join(str(i + 1) for i in sorted(offsets))
     descripcion = (
-        f"Se ha establecido --fps {int(fps_proceso)}. El vídeo va a {fps_video:.3f} fps "
-        f"(rate {rate}): de cada segundo se procesan los frames {ejemplo} "
-        f"({n_procesados} de {n_origen} frames)."
+        f"--fps {int(fps_proceso)} was set. The video is {fps_video:.3f} fps "
+        f"(rate {rate}): each second uses frames {ejemplo} "
+        f"({n_procesados} of {n_origen} frames)."
     )
     return {
-        "especificado": True,
-        "fps_parametro": int(fps_proceso),
-        "fps_video": round(float(fps_video), 4),
-        "rate_entero": rate,
-        "frames_origen": n_origen,
-        "frames_procesados": n_procesados,
-        "offsets_en_segundo": sorted(offsets),
-        "descripcion": descripcion,
+        "specified": True,
+        "fps_parameter": int(fps_proceso),
+        "video_fps": round(float(fps_video), 4),
+        "integer_rate": rate,
+        "source_frames": n_origen,
+        "processed_frames": n_procesados,
+        "offsets_in_second": sorted(offsets),
+        "description": descripcion,
     }
 
 
@@ -281,17 +320,20 @@ def cargar_detectores(args):
     for ruta in (args.modelo_pose, args.modelo_objeto):
         if not Path(ruta).is_file():
             raise SystemExit(f"Falta el modelo {ruta}")
-    catalogo = cargar_catalogo(args.identificadores)
+    catalogo, config_manos = cargar_catalogo(args.identificadores)
     args.catalogo = catalogo
+    args.config_manos = config_manos
     activos = [item for item in catalogo if item.activo]
+    estrategia = "mediapipe" if getattr(args, "mediapipe", False) else "pose"
     escena = AnalizadorEscena(
-        estrategia="pose",
+        estrategia=estrategia,
         modelo_pose=str(args.modelo_pose),
         dispositivo=dispositivo,
         padding_persona=args.padding,
         radio_mano=args.radio_mano,
         conf=args.conf_pose,
         imgsz=args.imgsz,
+        conf_mano=config_manos.min_confidence,
     )
     detector = DetectorUltralytics(
         modelo=str(args.modelo_objeto),
@@ -318,7 +360,11 @@ def cargar_detectores(args):
         )
     elif not activos:
         print("  Ningún identificador activo en el YAML.")
-    print(f"  Detectores en {dispositivo}: pose + seg + {'MobileSAM' if sam else 'sin SAM'}")
+    print(
+        f"  Detectors on {dispositivo}: {estrategia} + seg + "
+        f"{'MobileSAM' if sam else 'no SAM'} "
+        f"(hand min_confidence={config_manos.min_confidence:.2f})"
+    )
     return escena, detector, sam, identificadores
 
 
@@ -348,9 +394,17 @@ def _radio_palma_objeto(mano, args) -> float:
 
 
 def _pegado_a_palma(inst: Instancia, mano, args) -> bool:
+    """True si el centro o la caja tocan la palma, la muñeca o las yemas."""
+    radio = _radio_palma_objeto(mano, args)
     palma = mano.palma or mano.punto
-    dist = float(np.hypot(inst.centro[0] - palma[0], inst.centro[1] - palma[1]))
-    return dist <= _radio_palma_objeto(mano, args)
+    puntos = [palma, mano.punto, *(mano.puntos_agarre or [])]
+    cx, cy = float(inst.centro[0]), float(inst.centro[1])
+    for px, py in puntos:
+        if float(np.hypot(cx - float(px), cy - float(py))) <= radio:
+            return True
+        if _dentro_de_caja((float(px), float(py)), inst.caja, margen=10.0):
+            return True
+    return False
 
 
 def candidatos_en_munecas(frame, contexto, detector, sam, args) -> list[Instancia]:
@@ -625,8 +679,12 @@ def seguir_contenedores(frames, detector, cada: int, iou_min: float = 0.3,
     """Rastrea los contenedores por IoU y cercanía para tener un id estable y su último ROI."""
     if detector is None:
         return []
+    indices = list(range(0, len(frames), max(1, cada)))
+    ultimo = len(frames) - 1
+    if ultimo not in indices:
+        indices.append(ultimo)
     pistas: list[dict] = []
-    for indice in range(0, len(frames), max(1, cada)):
+    for indice in indices:
         for det in detector.detectar(frames[indice]):
             mejor, mejor_iou = None, -1.0
             for pista in pistas:
@@ -733,46 +791,123 @@ def _fraccion_caja_dentro(caja, contenedor) -> float:
     return float((ix2 - ix1) * (iy2 - iy1)) / area
 
 
-def contenedor_final(vistas: list[Vista], contenedores: list[dict], args) -> dict | None:
-    """¿El objeto acabó dentro del ROI de un carrito, cesto, bolso, mochila o bolsa?"""
+def _objeto_en_contenedor(vista: Vista, caja_cont) -> tuple[float, bool]:
+    """Fracción del ROI del objeto dentro del contenedor, y si el centro cae dentro."""
+    fraccion = _fraccion_caja_dentro(vista.caja, caja_cont)
+    centro_dentro = _dentro_de_caja(vista.centro, caja_cont)
+    return fraccion, centro_dentro
+
+
+def _destinos_deposito(contenedores) -> list[dict]:
+    """Cesto/carrito/bolsa: no el bolso o la mochila, que son accesorio."""
+    destinos = [p for p in contenedores if p.get("destino", False)]
+    utiles = [p for p in destinos if not p.get("accesorio")]
+    return utiles or destinos
+
+
+def _mano_en_caja(contexto, caja, margen: float = 40.0) -> bool:
+    if contexto is None:
+        return False
+    for mano in getattr(contexto, "manos", []) or []:
+        palma = mano.palma or mano.punto
+        if _dentro_de_caja(palma, caja, margen=margen):
+            return True
+        if _dentro_de_caja(mano.punto, caja, margen=margen):
+            return True
+    return False
+
+
+def contenedor_final(vistas: list[Vista], contenedores: list[dict], args,
+                    contextos=None) -> dict | None:
+    """Last object frame, proximity to the rim, or a later hand inside the destination."""
     if not vistas or not contenedores:
         return None
-    ultimas = vistas[-args.frames_fin :]
-    mejor = None
-    for pista in contenedores:
-        if not pista.get("destino", False):
-            continue
-        dentro = []
-        for vista in ultimas:
-            caja = caja_contenedor(pista, vista.frame)
-            area_cont = float(
-                max(1, caja[2] - caja[0]) * max(1, caja[3] - caja[1])
-            )
-            area_obj = float(
-                max(1, vista.caja[2] - vista.caja[0]) * max(1, vista.caja[3] - vista.caja[1])
-            )
-            # Un contenedor tiene que ser claramente más grande que lo que guarda:
-            # así el propio objeto no se cuenta como su propio contenedor.
-            if area_cont < args.factor_contenedor * area_obj:
-                continue
-            dentro.append(_fraccion_caja_dentro(vista.caja, caja))
-        if not dentro:
-            continue
-        fraccion = float(np.mean(dentro))
-        votos = sum(1 for f in dentro if f >= args.dentro_min) / len(dentro)
-        if votos < 0.5:
-            continue
-        candidato = {
+    destinos = _destinos_deposito(contenedores)
+    if not destinos:
+        return None
+    ultima = vistas[-1]
+    umbral = float(args.dentro_min)
+    umbral_suave = min(umbral, 0.35)
+    margen_px = 80.0
+
+    def candidato(pista, caja, fraccion, centro_dentro, frames_eval=1):
+        return {
             "id": pista["id"],
-            "categoria": pista["categoria"],
-            "roi": list(caja_contenedor(pista, ultimas[-1].frame)),
-            "fraccion_dentro": round(fraccion, 4),
-            "frames_evaluados": len(dentro),
+            "category": pista["categoria"],
+            "roi": list(caja),
+            "fraction_inside": round(float(fraccion), 4),
+            "center_inside": bool(centro_dentro),
+            "frames_evaluated": frames_eval,
             "score": pista["score_max"],
         }
-        if mejor is None or candidato["fraccion_dentro"] > mejor["fraccion_dentro"]:
-            mejor = candidato
-    return mejor
+
+    def mano_despues(pista) -> bool:
+        if contextos is None:
+            return False
+        for idx in range(ultima.frame, len(contextos)):
+            if _mano_en_caja(contextos[idx], caja_contenedor(pista, idx)):
+                return True
+        return False
+
+    mejor_dentro = None
+    mejor_cerca = None
+    for pista in destinos:
+        caja = caja_contenedor(pista, ultima.frame)
+        fraccion, centro_dentro = _objeto_en_contenedor(ultima, caja)
+        cerca = centro_dentro or _dentro_de_caja(ultima.centro, caja, margen=margen_px)
+        item = candidato(pista, caja, fraccion, centro_dentro)
+        if centro_dentro or fraccion >= umbral_suave:
+            if mejor_dentro is None or item["fraction_inside"] > mejor_dentro["fraction_inside"]:
+                mejor_dentro = item
+        elif cerca:
+            if mejor_cerca is None or item["fraction_inside"] > mejor_cerca["fraction_inside"]:
+                mejor_cerca = item | {"_pista": pista}
+
+    if mejor_dentro is not None:
+        return mejor_dentro
+    if mejor_cerca is not None and mano_despues(mejor_cerca.pop("_pista")):
+        mejor_cerca["center_inside"] = True
+        mejor_cerca["fraction_inside"] = max(mejor_cerca["fraction_inside"], 0.5)
+        return mejor_cerca
+
+    ultimas = vistas[-max(1, args.frames_fin) :]
+    mejor = None
+    for pista in destinos:
+        fracs = []
+        for vista in ultimas:
+            caja = caja_contenedor(pista, vista.frame)
+            fraccion, centro_dentro = _objeto_en_contenedor(vista, caja)
+            fracs.append(1.0 if centro_dentro else fraccion)
+        if not fracs:
+            continue
+        media = float(np.mean(fracs))
+        votos = sum(1 for f in fracs if f >= umbral_suave) / len(fracs)
+        if votos < 0.5:
+            continue
+        caja = caja_contenedor(pista, ultima.frame)
+        item = candidato(pista, caja, media, _dentro_de_caja(ultima.centro, caja), len(fracs))
+        if mejor is None or item["fraction_inside"] > mejor["fraction_inside"]:
+            mejor = item
+    if mejor is not None:
+        return mejor
+
+    if contextos is not None:
+        for pista in destinos:
+            caja_u = caja_contenedor(pista, ultima.frame)
+            cerca = (
+                _dentro_de_caja(ultima.centro, caja_u, margen=120.0)
+                or _fraccion_caja_dentro(ultima.caja, caja_u) >= 0.15
+            )
+            if not cerca or not mano_despues(pista):
+                continue
+            caja = caja_contenedor(pista, len(contextos) - 1)
+            return candidato(
+                pista, caja,
+                max(_fraccion_caja_dentro(ultima.caja, caja), 0.5),
+                True,
+                max(1, len(contextos) - ultima.frame),
+            )
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -824,6 +959,10 @@ def detectar_objetos(frames, escena, detector, sam, args):
     for indice, frame in enumerate(frames):
         contexto = escena.analizar(frame)
         contextos.append(contexto)
+        if not contexto.manos:
+            if indice % 20 == 0:
+                print(f"    frame {indice}: wrists below min_confidence, object model skipped")
+            continue
         for inst, agarre in objetos_del_frame(frame, contexto, detector, sam, args):
             total += 1
             centro = inst.centro
@@ -1112,6 +1251,118 @@ def trazar(objeto: Objeto, contextos, pista: dict, args) -> None:
         )
 
 
+def _registrar_mascara(objeto: Objeto, indice: int, mascara, contextos, args,
+                       origen: str = "deteccion") -> None:
+    caja = caja_desde_mascara(mascara)
+    if caja is None:
+        return
+    agarre = puntuar_manos(mascara, caja, contextos[indice], args)
+    ys, xs = np.nonzero(mascara)
+    objeto.mascaras[indice] = mascara
+    objeto.vistas[indice] = Vista(
+        frame=indice,
+        caja=caja,
+        centro=(float(xs.mean()), float(ys.mean())),
+        area=int(mascara.sum()),
+        mano=agarre["mano"],
+        score=round(agarre["score"], 4),
+        scores=agarre["scores"],
+        origen=origen,
+    )
+    objeto.ultimo_frame = max(objeto.ultimo_frame, indice)
+    objeto.centro = (float(xs.mean()), float(ys.mean()))
+
+
+def _detectar_en_deposito(frame, contexto, detector, sam, caja, args, area_ref, centro_ref):
+    """Busca un objeto compacto en el contenedor o en la mano que está dentro."""
+    alto, ancho = frame.shape[:2]
+    x1, y1, x2, y2 = caja
+    caja_e = (
+        max(0, int(x1) - 24),
+        max(0, int(y1) - 24),
+        min(ancho, int(x2) + 24),
+        min(alto, int(y2) + 24),
+    )
+    candidatos = list(detector.detectar_en_caja(frame, caja_e, args.conf_objeto_crop))
+    for mano in contexto.manos:
+        palma = mano.palma or mano.punto
+        if not _dentro_de_caja(palma, caja, margen=50):
+            continue
+        rec = caja_muneca(mano, args.padding_muneca, args.crop_min, ancho, alto)
+        recorte = rec[:4]
+        candidatos.extend(detector.detectar_en_caja(frame, recorte, args.conf_objeto_crop))
+        if sam is not None:
+            candidatos.extend(_sam_en_palma(sam, detector, frame, mano, recorte, args))
+    mejor, mejor_s = None, 1e9
+    area_ref = max(1.0, float(area_ref))
+    for inst in candidatos:
+        if inst.es_persona or inst.area < args.area_min:
+            continue
+        if inst.area > max(float(args.area_max_px), 4.0 * area_ref):
+            continue
+        if inst.area < 0.2 * area_ref:
+            continue
+        if es_voluminoso(inst, contexto) or not _forma_de_objeto(inst, args):
+            continue
+        en_destino = _dentro_de_caja(inst.centro, caja, margen=30)
+        en_mano = any(_pegado_a_palma(inst, m, args) for m in contexto.manos)
+        if not en_destino and not en_mano:
+            continue
+        dist = float(np.hypot(inst.centro[0] - centro_ref[0], inst.centro[1] - centro_ref[1]))
+        score = dist + 0.002 * abs(inst.area - area_ref)
+        if score < mejor_s:
+            mejor, mejor_s = inst, score
+    return mejor
+
+
+def completar_deposito(frames, objetos, contenedores, contextos, detector, sam, args):
+    """Si la mano entra en un cesto/carrito, sigue el objeto aunque se suelte un poco."""
+    destinos = _destinos_deposito(contenedores)
+    if not destinos or not objetos or detector is None:
+        return objetos
+    activos = [o for o in objetos if o.vistas]
+    for indice, frame in enumerate(frames):
+        ctx = contextos[indice]
+        cajas = [caja_contenedor(p, indice) for p in destinos]
+        if not any(_mano_en_caja(ctx, caja, margen=50) for caja in cajas):
+            continue
+        pendientes = []
+        for objeto in activos:
+            if indice in objeto.vistas:
+                continue
+            ultima = max(objeto.vistas)
+            if indice < ultima or indice - ultima > args.hueco_parpadeo + 4:
+                continue
+            pendientes.append(objeto)
+        if not pendientes:
+            continue
+        for caja in cajas:
+            def _dist_obj(objeto, caja=caja, indice=indice):
+                vista = objeto.vistas[max(f for f in objeto.vistas if f <= indice)]
+                cx = 0.5 * (caja[0] + caja[2])
+                cy = 0.5 * (caja[1] + caja[3])
+                return float(np.hypot(vista.centro[0] - cx, vista.centro[1] - cy))
+
+            pendientes.sort(key=_dist_obj)
+            objeto = pendientes[0]
+            vista = objeto.vistas[max(f for f in objeto.vistas if f <= indice)]
+            inst = _detectar_en_deposito(
+                frame, ctx, detector, sam, caja, args, vista.area, vista.centro,
+            )
+            if inst is None:
+                continue
+            dist = float(
+                np.hypot(inst.centro[0] - vista.centro[0], inst.centro[1] - vista.centro[1])
+            )
+            if dist > args.distancia_max:
+                continue
+            _registrar_mascara(objeto, indice, inst.mascara, contextos, args)
+            pendientes.pop(0)
+            if not pendientes:
+                break
+    return objetos
+
+
 # --------------------------------------------------------------------------- #
 # Eventos
 # --------------------------------------------------------------------------- #
@@ -1172,15 +1423,35 @@ def eventos_de(objeto: Objeto, fps: float, args) -> list[dict]:
 def estado_final(objeto: Objeto, nframes: int, contenedor: dict | None, args) -> str:
     vistas = [objeto.vistas[i] for i in sorted(objeto.vistas)]
     if not vistas:
-        return "sin_datos"
+        return "no_data"
     ultima = vistas[-1]
     if contenedor is not None:
-        return "dentro_de_contenedor"
+        return "inside_container"
     if nframes - 1 - ultima.frame > args.hueco_parpadeo:
-        return "desaparecido"
+        return "disappeared"
     if ultima.mano is None:
-        return "suelto"
-    return "en_mano"
+        return "released"
+    return "in_hand"
+
+
+def _final_state_video(informes: list[dict]) -> str:
+    if not informes:
+        return "no_data"
+    rango = {
+        "inside_container": 0,
+        "in_hand": 1,
+        "released": 2,
+        "disappeared": 3,
+        "no_data": 4,
+        "no_hands": 5,
+    }
+    return min(
+        informes,
+        key=lambda info: (
+            rango.get(info.get("final_state"), 9),
+            -(info.get("last_visible_frame") or 0),
+        ),
+    )["final_state"]
 
 
 # --------------------------------------------------------------------------- #
@@ -1190,6 +1461,33 @@ def estado_final(objeto: Objeto, nframes: int, contenedor: dict | None, args) ->
 
 def _etiqueta_mano(mano: str | None) -> str:
     return {"izquierda": "IZQ", "derecha": "DER", "ambas": "AMBAS"}.get(mano or "", "SUELTO")
+
+
+def _overlay_objeto(objeto: Objeto, indice: int, contenedores) -> tuple:
+    """Máscara del frame o, si ya está en un destino (no accesorio), la última vista en el ROI."""
+    vista = objeto.vistas.get(indice)
+    mascara = objeto.mascaras.get(indice)
+    if vista is not None and mascara is not None:
+        return vista, mascara
+    destinos = _destinos_deposito(contenedores)
+    if not destinos:
+        return None, None
+    anteriores = [f for f in objeto.vistas if f <= indice]
+    if not anteriores:
+        return None, None
+    ultimo = max(anteriores)
+    if indice - ultimo > 8:
+        return None, None
+    vista = objeto.vistas[ultimo]
+    mascara = objeto.mascaras.get(ultimo)
+    if mascara is None:
+        return None, None
+    for pista in destinos:
+        caja = caja_contenedor(pista, indice)
+        fraccion, centro_dentro = _objeto_en_contenedor(vista, caja)
+        if centro_dentro or fraccion >= 0.35:
+            return vista, mascara
+    return None, None
 
 
 def anotar(frames, destino: Path, objetos: list[Objeto], contenedores, fps_salida: float,
@@ -1217,11 +1515,10 @@ def anotar(frames, destino: Path, objetos: list[Objeto], contenedores, fps_salid
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA,
             )
         for objeto in objetos:
-            vista = objeto.vistas.get(indice)
-            if vista is None:
+            vista, mascara = _overlay_objeto(objeto, indice, contenedores)
+            if vista is None or mascara is None:
                 continue
             color = COLOR_OBJETO[(objeto.id - 1) % len(COLOR_OBJETO)]
-            mascara = objeto.mascaras[indice]
             frame[mascara] = (
                 (1.0 - alfa) * frame[mascara] + alfa * np.array(color, dtype=np.float32)
             ).astype(np.uint8)
@@ -1236,11 +1533,14 @@ def anotar(frames, destino: Path, objetos: list[Objeto], contenedores, fps_salid
         if dibujar_esqueleto and contextos is not None and indice < len(contextos):
             dibujar_pose(frame, contextos[indice])
         cv2.rectangle(frame, (0, 0), (ancho, 34), (0, 0, 0), -1)
-        activos = sum(1 for o in objetos if indice in o.vistas)
+        activos = sum(
+            1 for o in objetos
+            if _overlay_objeto(o, indice, contenedores)[0] is not None
+        )
         t = orig / fps_video if fps_video else 0.0
         cv2.putText(
             frame,
-            f"frame {orig}  t={t:.2f}s  objetos en mano: {activos}",
+            f"frame {orig}  t={t:.2f}s  handheld objects: {activos}",
             (12, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (240, 240, 240), 1, cv2.LINE_AA,
         )
         escritor.write(frame)
@@ -1260,9 +1560,9 @@ def anotar(frames, destino: Path, objetos: list[Objeto], contenedores, fps_salid
 
 
 def informe_objeto(objeto: Objeto, fps: float, nframes: int, contenedores, args,
-                   indices_origen: list[int] | None = None) -> dict:
+                   indices_origen: list[int] | None = None, contextos=None) -> dict:
     vistas = [objeto.vistas[i] for i in sorted(objeto.vistas)]
-    contenedor = contenedor_final(vistas, contenedores, args)
+    contenedor = contenedor_final(vistas, contenedores, args, contextos)
     manos = {"izquierda": 0, "derecha": 0, "ambas": 0, "sin_mano": 0}
     for vista in vistas:
         manos[vista.mano or "sin_mano"] += 1
@@ -1273,107 +1573,132 @@ def informe_objeto(objeto: Objeto, fps: float, nframes: int, contenedores, args,
     linea = [
         {
             "frame": orig(v.frame),
-            "frame_procesado": v.frame,
+            "processed_frame": v.frame,
             "t": round(orig(v.frame) / fps, 4) if fps else None,
-            "mano": v.mano,
+            "hand": _mano_en(v.mano),
             "roi": list(v.caja),
-            "centro": [round(v.centro[0], 2), round(v.centro[1], 2)],
+            "center": [round(v.centro[0], 2), round(v.centro[1], 2)],
             "area": v.area,
-            "score_agarre": v.score,
-            "scores_mano": v.scores,
-            "origen": v.origen,
+            "grip_score": v.score,
+            "hand_scores": {_mano_en(k) or k: val for k, val in (v.scores or {}).items()},
+            "origin": "detection" if v.origen == "deteccion" else "propagation",
         }
         for v in vistas
     ]
     en_mano = [v for v in vistas if v.mano]
     eventos = eventos_de(objeto, fps, args)
+    eventos_en = []
     for evento in eventos:
         interno = evento["frame"]
-        evento["frame_procesado"] = interno
-        evento["frame"] = orig(interno)
-        evento["t"] = round(orig(interno) / fps, 4) if fps else None
+        item = {
+            "type": EVENTO_EN.get(evento["tipo"], evento["tipo"]),
+            "frame": orig(interno),
+            "processed_frame": interno,
+            "t": round(orig(interno) / fps, 4) if fps else None,
+            "hand": _mano_en(evento.get("mano")),
+            "center": evento.get("centro"),
+            "roi": evento.get("roi"),
+        }
+        if "desde" in evento:
+            item["from"] = _mano_en(evento["desde"])
+        if "hasta" in evento:
+            item["to"] = _mano_en(evento["hasta"])
+        if "mano_anterior" in evento:
+            item["previous_hand"] = _mano_en(evento["mano_anterior"])
+        eventos_en.append(item)
+    manos_en = {
+        "left": manos["izquierda"],
+        "right": manos["derecha"],
+        "both": manos["ambas"],
+        "no_hand": manos["sin_mano"],
+    }
+    dominante = max(manos, key=manos.get) if vistas else None
     return {
         "id": objeto.id,
         "frames_visible": len(vistas),
-        "frames_en_mano": len(en_mano),
-        "primer_frame": orig(vistas[0].frame) if vistas else None,
-        "ultimo_frame": orig(vistas[-1].frame) if vistas else None,
-        "resiembras": objeto.resiembras,
-        "manos": manos,
-        "mano_predominante": max(manos, key=manos.get) if vistas else None,
-        "ultimo_roi": list(vistas[-1].caja) if vistas else None,
-        "ultimo_centro": (
+        "frames_in_hand": len(en_mano),
+        "first_frame": orig(vistas[0].frame) if vistas else None,
+        "last_frame": orig(vistas[-1].frame) if vistas else None,
+        "reseeds": objeto.resiembras,
+        "hands": manos_en,
+        "dominant_hand": _mano_en(dominante),
+        "last_roi": list(vistas[-1].caja) if vistas else None,
+        "last_center": (
             [round(vistas[-1].centro[0], 2), round(vistas[-1].centro[1], 2)] if vistas else None
         ),
-        "ultimo_frame_visible": orig(vistas[-1].frame) if vistas else None,
-        "estado_final": estado_final(objeto, nframes, contenedor, args),
-        "acaba_en_contenedor": contenedor is not None,
-        "contenedor_final": contenedor,
-        "eventos": eventos,
-        "linea_temporal": linea,
+        "last_visible_frame": orig(vistas[-1].frame) if vistas else None,
+        "final_state": estado_final(objeto, nframes, contenedor, args),
+        "ends_in_container": contenedor is not None,
+        "final_container": contenedor,
+        "events": eventos_en,
+        "timeline": linea,
     }
 
 
 def resumen(video: Path, informes: list[dict], contenedores, nframes: int, modelo: str,
-            yaml_identificadores: Path | None = None, muestreo: dict | None = None) -> str:
+            yaml_identificadores: Path | None = None, muestreo: dict | None = None,
+            final_state: str | None = None, pose_backend: str = "yolo-pose") -> str:
     lineas = [
-        f"Vídeo: {video}",
-        f"Frames procesados: {nframes}",
-        f"Modelo: {modelo}. Las muñecas salen de YOLO26n-pose, el objeto del recorte de "
-        "la muñeca y los identificadores de escena del YAML "
+        f"Video: {video}",
+        f"Processed frames: {nframes}",
+        f"Model: {modelo}. Wrists come from {pose_backend}; the object from the wrist "
+        f"crop; scene identifiers from the YAML "
         f"({yaml_identificadores or YAML_IDENTIFICADORES}).",
         (muestreo or {}).get(
-            "descripcion",
-            "No se ha especificado --fps. El procesamiento ha sido de frame a frame.",
+            "description",
+            "--fps was not set. Processing ran frame by frame.",
         ),
         "",
     ]
     if contenedores:
-        lineas.append("Identificadores de escena:")
+        lineas.append("Scene identifiers:")
         for pista in contenedores:
             extra = []
             if pista.get("destino"):
-                extra.append("destino")
+                extra.append("destination")
             if pista.get("accesorio"):
-                extra.append("accesorio")
+                extra.append("accessory")
             sufijo = f" [{', '.join(extra)}]" if extra else ""
             lineas.append(
-                f"  {pista['id']}: ROI {list(pista['caja'])}, score máx {pista['score_max']:.2f}, "
-                f"visto en {pista['frames_visto']} muestreos{sufijo}"
+                f"  {pista['id']}: ROI {list(pista['caja'])}, max score {pista['score_max']:.2f}, "
+                f"seen in {pista['frames_visto']} samples{sufijo}"
             )
     else:
-        lineas.append("No se detectó ningún identificador activo del YAML.")
+        lineas.append("No active identifier from the YAML was detected.")
     lineas.append("")
     if not informes:
-        lineas.append("Ningún objeto sostenido en las manos.")
+        if final_state == "no_hands":
+            lineas.append("No wrists were visible. final_state: no_hands")
+        else:
+            lineas.append("No handheld object.")
         return "\n".join(lineas) + "\n"
     for info in informes:
+        manos = info["hands"]
         lineas.append(
-            f"Objeto {info['id']}: visible en {info['frames_visible']} frames, "
-            f"en mano en {info['frames_en_mano']} "
-            f"(izquierda {info['manos']['izquierda']}, derecha {info['manos']['derecha']}, "
-            f"ambas {info['manos']['ambas']})"
+            f"Object {info['id']}: visible in {info['frames_visible']} frames, "
+            f"in hand in {info['frames_in_hand']} "
+            f"(left {manos['left']}, right {manos['right']}, both {manos['both']})"
         )
-        for evento in info["eventos"]:
+        for evento in info["events"]:
             detalle = ""
-            if evento["tipo"] == "cambio_de_mano":
-                detalle = f" de {evento['desde']} a {evento['hasta']}"
+            if evento["type"] == "hand_change":
+                detalle = f" from {evento.get('from')} to {evento.get('to')}"
             lineas.append(
-                f"  frame {evento['frame']} ({evento['t']} s): {evento['tipo']}{detalle}"
+                f"  frame {evento['frame']} ({evento['t']} s): {evento['type']}{detalle}"
             )
-        lineas.append(f"  último ROI: {info['ultimo_roi']} en el frame {info['ultimo_frame']}")
-        if info["contenedor_final"]:
-            cont = info["contenedor_final"]
+        lineas.append(f"  last ROI: {info['last_roi']} at frame {info['last_frame']}")
+        if info["final_container"]:
+            cont = info["final_container"]
             lineas.append(
-                f"  acaba dentro de {cont['id']} ({cont['categoria']}), ROI {cont['roi']}, "
-                f"{100 * cont['fraccion_dentro']:.0f} % del objeto dentro"
+                f"  ends inside {cont['id']} ({cont['category']}), ROI {cont['roi']}, "
+                f"{100 * cont['fraction_inside']:.0f} % of the object inside"
             )
         else:
-            lineas.append("  no acaba dentro de ningún contenedor")
-        lineas.append(f"  estado final: {info['estado_final']}")
+            lineas.append("  does not end inside any container")
+        lineas.append(f"  final_state: {info['final_state']}")
     lineas.append(
-        "\nIzquierda y derecha son las de la persona. «ambas» significa que las dos "
-        "manos superan el umbral de agarre en el mismo frame."
+        "\nLeft and right are the person's hands. «both» means both hands beat the "
+        "grip threshold on the same frame."
     )
     return "\n".join(lineas) + "\n"
 
@@ -1392,7 +1717,12 @@ def anadir_argumentos_comunes(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--modelo-contenedores", type=Path, default=PESOS / "yoloe-26m-seg.pt")
     parser.add_argument(
         "--identificadores", type=Path, default=YAML_IDENTIFICADORES,
-        help="YAML para activar o desactivar carrito, bolso, mochila, celular, etc.",
+        help="YAML de identificadores (identifiers.yaml). Claves en inglés.",
+    )
+    parser.add_argument(
+        "--mediapipe", action="store_true",
+        help="Usa el esqueleto MediaPipe (Pose + Hands) en lugar de YOLO-pose. "
+             "El umbral de muñecas es hands.min_confidence en el YAML.",
     )
     parser.add_argument("--sin-sam", action="store_true", help="No usar MobileSAM en la palma.")
     parser.add_argument(
@@ -1500,7 +1830,8 @@ def escribir_salidas(
 ) -> None:
     muestreo = describir_muestreo(args.fps, fps, nframes_origen, nframes)
     informes = [
-        informe_objeto(o, fps, nframes, contenedores, args, indices_origen) for o in objetos
+        informe_objeto(o, fps, nframes, contenedores, args, indices_origen, contextos)
+        for o in objetos
     ]
     offsets, _rate = offsets_muestreo(fps, args.fps)
     fps_salida = float(args.fps) if offsets is not None else fps
@@ -1517,75 +1848,87 @@ def escribir_salidas(
     def orig(idx: int) -> int:
         return frame_origen(idx, indices_origen)
 
+    extra = extra or {}
+    if extra.get("final_state") is None:
+        extra["final_state"] = _final_state_video(informes)
+    pose_backend = "mediapipe" if getattr(args, "mediapipe", False) else "yolo-pose"
     traza = {
         "video": str(video),
-        "modelo": modelo,
-        "ancho": ancho,
-        "alto": alto,
+        "model": modelo,
+        "width": ancho,
+        "height": alto,
         "frames": nframes,
-        "frames_origen": nframes_origen,
+        "source_frames": nframes_origen,
         "fps": fps,
-        "fps_salida": fps_salida,
-        "muestreo": muestreo,
-        "parametros": {
-            "padding_muneca": args.padding_muneca,
+        "output_fps": fps_salida,
+        "sampling": muestreo,
+        "pose_backend": pose_backend,
+        "hands_visible": extra.get("hands_visible", True),
+        "final_state": extra.get("final_state"),
+        "parameters": {
+            "wrist_padding": args.padding_muneca,
             "crop_min": args.crop_min,
-            "factor_palma": args.factor_palma,
-            "umbral_agarre": args.umbral_agarre,
-            "contacto_min": args.contacto_min,
-            "conf_contenedor": args.conf_contenedor,
-            "cada_contenedor": args.cada_contenedor,
-            "dentro_min": args.dentro_min,
-            "factor_contenedor": args.factor_contenedor,
-            "identificadores_yaml": str(args.identificadores),
+            "palm_factor": args.factor_palma,
+            "grip_threshold": args.umbral_agarre,
+            "min_contact": args.contacto_min,
+            "container_conf": args.conf_contenedor,
+            "container_every": args.cada_contenedor,
+            "inside_min": args.dentro_min,
+            "container_factor": args.factor_contenedor,
+            "identifiers_yaml": str(args.identificadores),
+            "hand_min_confidence": getattr(getattr(args, "config_manos", None), "min_confidence", None),
+            "mediapipe": bool(getattr(args, "mediapipe", False)),
             "fps": args.fps,
         },
-        "identificadores_yaml": [
+        "identifiers_yaml": [
             {
-                "clave": item.clave,
-                "activo": item.activo,
+                "key": item.clave,
+                "active": item.activo,
                 "ultralytics_id": item.ultralytics_id,
-                "nombre": item.nombre,
+                "name": item.nombre,
                 "prompts": item.prompts,
-                "destino": item.destino,
-                "accesorio": item.accesorio,
+                "destination": item.destino,
+                "accessory": item.accesorio,
             }
             for item in getattr(args, "catalogo", [])
         ],
-        "contenedores": [
+        "containers": [
             {
                 "id": p["id"],
-                "categoria": p["categoria"],
+                "category": p["categoria"],
                 "prompt": p["texto"],
-                "score_medio": p["score_medio"],
-                "score_max": p["score_max"],
-                "primer_frame": orig(p["primer_frame"]),
-                "ultimo_frame": orig(p["ultimo_frame"]),
-                "frames_visto": p["frames_visto"],
-                "destino": bool(p.get("destino", False)),
-                "accesorio": bool(p.get("accesorio", False)),
-                "roi_ultimo": list(p["caja"]),
+                "mean_score": p["score_medio"],
+                "max_score": p["score_max"],
+                "first_frame": orig(p["primer_frame"]),
+                "last_frame": orig(p["ultimo_frame"]),
+                "frames_seen": p["frames_visto"],
+                "destination": bool(p.get("destino", False)),
+                "accessory": bool(p.get("accesorio", False)),
+                "last_roi": list(p["caja"]),
                 "rois": {str(orig(f)): list(c) for f, c in sorted(p["cajas"].items())},
             }
             for p in contenedores
         ],
-        "objetos": informes,
+        "objects": informes,
     }
     if extra:
-        traza.update(extra)
-    (destino / "seguimiento.json").write_text(
+        for clave, valor in extra.items():
+            if clave not in traza or traza[clave] is None:
+                traza[clave] = valor
+    (destino / "tracking.json").write_text(
         json.dumps(traza, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     texto = resumen(
         video, informes, contenedores, nframes, modelo, args.identificadores, muestreo,
+        final_state=traza.get("final_state"), pose_backend=pose_backend,
     )
-    (destino / "resumen.txt").write_text(texto, encoding="utf-8")
-    (destino / "metricas.json").write_text(
+    (destino / "summary.txt").write_text(texto, encoding="utf-8")
+    (destino / "metrics.json").write_text(
         json.dumps(metricas, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     frames_con_objeto = len({i for o in objetos for i in o.vistas})
     desapariciones = sum(
-        1 for info in informes for e in info["eventos"] if e["tipo"] == "desaparece"
+        1 for info in informes for e in info["events"] if e["type"] == "disappears"
     )
     ruta = publicar_comparativa(
         args.salida, tecnologia, video.stem, backend, destino, metricas,
@@ -1613,18 +1956,30 @@ def procesar_video(
         nframes_origen = min(nframes_origen, args.max_frames)
     muestreo = describir_muestreo(args.fps, fps, nframes_origen, len(frames))
     print(f"\n=== {video.name}: {ancho}x{alto}, {len(frames)} frames procesados, {fps:.3f} fps ===")
-    print(f"  {muestreo['descripcion']}")
+    print(f"  {muestreo['description']}")
     destino = carpeta_de(args.salida, tecnologia, video)
     medidor = Medidor(tecnologia)
+    extra = dict(extra or {})
     try:
         escena, detector, sam, det_contenedores = detectores
         with medidor.etapa("segmentacion"):
             contextos, pistas = detectar_objetos(frames, escena, detector, sam, args)
-            objetos = seguir(frames, pistas, contextos, args)
-            contenedores = seguir_contenedores(frames, det_contenedores, args.cada_contenedor)
-            objetos = descartar_accesorios(objetos, contenedores)
-            objetos = quedarse_con_agarrados(objetos, args)
-            contenedores = descartar_contenedores_en_mano(contenedores, objetos, args)
+            manos_visibles = any(bool(ctx.manos) for ctx in contextos)
+            extra["hands_visible"] = manos_visibles
+            if not manos_visibles:
+                extra["final_state"] = "no_hands"
+                objetos = []
+                contenedores = seguir_contenedores(frames, det_contenedores, args.cada_contenedor)
+                print("  No wrists visible above min_confidence. Object model was not applied.")
+            else:
+                objetos = seguir(frames, pistas, contextos, args)
+                contenedores = seguir_contenedores(frames, det_contenedores, args.cada_contenedor)
+                objetos = completar_deposito(
+                    frames, objetos, contenedores, contextos, detector, sam, args
+                )
+                objetos = descartar_accesorios(objetos, contenedores)
+                objetos = quedarse_con_agarrados(objetos, args)
+                contenedores = descartar_contenedores_en_mano(contenedores, objetos, args)
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         escribir_salidas(
