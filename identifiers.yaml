@@ -19,9 +19,10 @@
 # destination: true  → the handheld object may end inside this ROI.
 # accessory: true    → shoulder bag / backpack: do not treat as the grasped object.
 #
-# hands.min_confidence: wrist/hand visibility threshold. Below this value the
-# object model is not applied on that frame. If no wrist is ever visible,
-# final_state is "no_hands".
+# hands.min_confidence: wrist/hand visibility threshold, applied per hand.
+# A hand below this value is not searched for objects. If no wrist is ever
+# visible, final_state is "no_hands". MediaPipe also rejects masks that are
+# the empty hand itself (landmarks cover the mask) rather than a grasped object.
 
 hands:
   min_confidence: 0.20

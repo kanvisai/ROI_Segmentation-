@@ -81,6 +81,53 @@ def _contacto_dedos(mascara: np.ndarray, mano: Mano) -> float:
     return toques / len(puntos)
 
 
+def _caja_landmarks_mano(mano: Mano, margen: float = 10.0) -> Caja:
+    pts = [mano.punto]
+    if mano.palma is not None:
+        pts.append(mano.palma)
+    pts.extend(mano.puntos_agarre or [])
+    xs = [float(p[0]) for p in pts]
+    ys = [float(p[1]) for p in pts]
+    return (
+        min(xs) - margen,
+        min(ys) - margen,
+        max(xs) + margen,
+        max(ys) + margen,
+    )
+
+
+def _fraccion_mascara_fuera(mascara: np.ndarray, caja: Caja) -> float:
+    ys, xs = np.nonzero(mascara)
+    if xs.size == 0:
+        return 0.0
+    x1, y1, x2, y2 = caja
+    fuera = (xs < x1) | (xs > x2) | (ys < y1) | (ys > y2)
+    return float(np.count_nonzero(fuera)) / float(xs.size)
+
+
+def mascara_es_la_mano(instancia: Instancia, mano: Mano) -> bool:
+    """True si SAM/YOLO segmentó la mano vacía, no un objeto entre los dedos.
+
+    Solo con landmarks reales de MediaPipe (conexiones). El abanico de YOLO-pose
+    no vale: sus puntos ya caen fuera de la palma.
+    """
+    if getattr(mano, "origen", "") != "mediapipe":
+        return False
+    if not getattr(mano, "conexiones", None):
+        return False
+    yemas = list(mano.puntos_agarre or [])[:5]
+    if len(yemas) < 4:
+        return False
+    muneca = _punto_toca_mascara(instancia.mascara, mano.punto, 6)
+    yemas_tocan = sum(1 for p in yemas if _punto_toca_mascara(instancia.mascara, p, 6))
+    pts = [mano.punto, mano.palma or mano.punto, *list(mano.puntos_agarre or [])]
+    lms = sum(1 for p in pts if _punto_toca_mascara(instancia.mascara, p, 6))
+    cubre_mano = (muneca and yemas_tocan >= 4) or (lms >= 0.85 * len(pts))
+    if not cubre_mano:
+        return False
+    return _fraccion_mascara_fuera(instancia.mascara, _caja_landmarks_mano(mano)) < 0.08
+
+
 def _encuadre_en_persona(caja: Caja, contexto: ContextoEscena) -> float:
     if not contexto.personas:
         return 1.0
@@ -233,10 +280,19 @@ def anotar_agarre(
             ) if instancia.extra.get("detalle_agarre") else 0.0
         else:
             contacto = float(detalle.get("contacto") or 0.0)
+        mano_lado = next((m for m in contexto.manos if m.lado == lado), None)
+        es_mano = bool(mano_lado is not None and mascara_es_la_mano(instancia, mano_lado))
+        proximidad = float(detalle.get("proximidad") or 0.0)
+        contacto_ok = (
+            contacto >= MIN_CONTACTO_AGARRE
+            or not contexto.manos
+            or (proximidad >= 0.55 and not es_mano)
+        )
         instancia.en_mano = bool(
             score >= umbral
             and (lado or not contexto.manos)
-            and (contacto >= MIN_CONTACTO_AGARRE or not contexto.manos)
+            and contacto_ok
+            and not es_mano
         )
         anotadas.append(instancia)
     anotadas.sort(key=lambda i: i.score_agarre, reverse=True)

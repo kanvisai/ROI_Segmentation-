@@ -1,6 +1,7 @@
 # Scene identifiers: detected on the full frame, without waiting for a hand.
 # Canonical file: identifiers.yaml. This copy keeps older --identificadores paths working.
 
+# hands.min_confidence applies per hand. MediaPipe rejects empty-hand masks.
 hands:
   min_confidence: 0.20
 

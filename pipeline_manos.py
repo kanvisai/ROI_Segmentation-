@@ -27,7 +27,7 @@ import numpy as np
 import torch
 import yaml
 
-from detector_palma.agarre import anotar_agarre, es_voluminoso, puntuar_agarre
+from detector_palma.agarre import anotar_agarre, es_voluminoso, mascara_es_la_mano, puntuar_agarre
 from detector_palma.geometria import caja_desde_mascara, iou_cajas
 from detector_palma.personas import dibujar_pose
 from detector_palma.tipos import Instancia
@@ -419,7 +419,10 @@ def candidatos_en_munecas(frame, contexto, detector, sam, args) -> list[Instanci
     if area_persona:
         area_max = min(area_max, max(float(args.area_min), args.area_max_persona * area_persona))
     candidatos: list[Instancia] = []
+    umbral_mano = float(getattr(contexto, "conf_dibujo", 0.20) or 0.20)
     for mano in contexto.manos:
+        if float(mano.confianza) < umbral_mano:
+            continue
         x1, y1, x2, y2, _radio = caja_muneca(
             mano, args.padding_muneca, args.crop_min, ancho, alto
         )
@@ -438,6 +441,8 @@ def candidatos_en_munecas(frame, contexto, detector, sam, args) -> list[Instanci
             if not _forma_de_objeto(inst, args):
                 continue
             if es_voluminoso(inst, contexto):
+                continue
+            if mascara_es_la_mano(inst, mano):
                 continue
             candidatos.append(inst)
     return _sin_duplicados(candidatos)
@@ -524,7 +529,9 @@ def puntuar_manos(mascara: np.ndarray, caja, contexto, args) -> dict:
         contacto = max((d.get("contacto") or 0.0) for d in detalle.values()) if detalle else 0.0
     else:
         contacto = float((detalle.get(lado) or {}).get("contacto") or 0.0)
-    en_mano = bool(lado) and score >= args.umbral_agarre and contacto >= args.contacto_min
+    mano_lado = next((m for m in contexto.manos if m.lado == lado), None)
+    es_mano = bool(mano_lado is not None and mascara_es_la_mano(inst, mano_lado))
+    en_mano = bool(lado) and score >= args.umbral_agarre and contacto >= args.contacto_min and not es_mano
     return {
         "mano": lado if en_mano else None,
         "score": float(score),
@@ -642,19 +649,6 @@ def _det_identificador(ident: Identificador, texto: str, score: float, caja) -> 
 DetectorContenedores = DetectorIdentificadores
 
 
-def _fusionar_contenedores(detecciones: list[dict], iou_max: float = 0.55) -> list[dict]:
-    """Varios prompts ven el mismo objeto (cart y trolley): se queda el de más score."""
-    salida: list[dict] = []
-    for det in sorted(detecciones, key=lambda d: -d["score"]):
-        if any(
-            iou_cajas(det["caja"], ya["caja"]) > iou_max and ya["categoria"] == det["categoria"]
-            for ya in salida
-        ):
-            continue
-        salida.append(det)
-    return salida
-
-
 def _centro_caja(caja) -> tuple[float, float]:
     x1, y1, x2, y2 = caja
     return ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
@@ -665,43 +659,143 @@ def _diagonal(caja) -> float:
     return float(np.hypot(max(1, x2 - x1), max(1, y2 - y1)))
 
 
-def _misma_pista(caja_a, caja_b, iou_min: float, factor_centro: float) -> bool:
+def _cajas_cercanas(caja_a, caja_b, holgura: float = 48.0) -> bool:
+    """YOLO y YOLOE a menudo parten el mismo bolso en dos cajas que apenas se solapan."""
+    if caja_a is None or caja_b is None:
+        return False
+    if iou_cajas(caja_a, caja_b) >= 0.15:
+        return True
+    xa1, ya1, xa2, ya2 = caja_a
+    xb1, yb1, xb2, yb2 = caja_b
+    ix1, iy1 = max(xa1, xb1), max(ya1, yb1)
+    ix2, iy2 = min(xa2, xb2), min(ya2, yb2)
+    if ix2 > ix1 and iy2 > iy1:
+        inter = float((ix2 - ix1) * (iy2 - iy1))
+        area_a = float(max(1, xa2 - xa1) * max(1, ya2 - ya1))
+        area_b = float(max(1, xb2 - xb1) * max(1, yb2 - yb1))
+        if inter / min(area_a, area_b) >= 0.35:
+            return True
+    ca, cb = _centro_caja(caja_a), _centro_caja(caja_b)
+    dist = float(np.hypot(ca[0] - cb[0], ca[1] - cb[1]))
+    return dist <= 0.28 * (_diagonal(caja_a) + _diagonal(caja_b)) + holgura
+
+
+def _fusionar_contenedores(detecciones: list[dict], iou_max: float = 0.55) -> list[dict]:
+    """Varios prompts ven el mismo objeto (cart y trolley): se queda el de más score."""
+    salida: list[dict] = []
+    for det in sorted(detecciones, key=lambda d: -d["score"]):
+        if any(
+            ya["categoria"] == det["categoria"]
+            and (
+                iou_cajas(det["caja"], ya["caja"]) > iou_max
+                or (
+                    (det.get("accesorio") or ya.get("accesorio"))
+                    and _cajas_cercanas(det["caja"], ya["caja"])
+                )
+            )
+            for ya in salida
+        ):
+            continue
+        salida.append(det)
+    return salida
+
+
+def _misma_pista(
+    caja_a, caja_b, iou_min: float, factor_centro: float,
+    hueco: int = 1, accesorio: bool = False,
+) -> bool:
     """El contenedor se mueve con la persona: el IoU solo no basta para reconocerlo."""
     if iou_cajas(caja_a, caja_b) >= iou_min:
         return True
     ca, cb = _centro_caja(caja_a), _centro_caja(caja_b)
     distancia = float(np.hypot(ca[0] - cb[0], ca[1] - cb[1]))
-    return distancia <= factor_centro * 0.5 * (_diagonal(caja_a) + _diagonal(caja_b))
+    base = factor_centro * 0.5 * (_diagonal(caja_a) + _diagonal(caja_b))
+    paso = (90.0 if accesorio else 24.0) * max(1, hueco)
+    return distancia <= base + paso
+
+
+def _indice_persona(caja, contexto, factor: float = 2.4):
+    if contexto is None or not getattr(contexto, "personas", None):
+        return None
+    c = _centro_caja(caja)
+    mejor, mejor_d = None, 1e9
+    for i, persona in enumerate(contexto.personas):
+        pc = _centro_caja(persona.caja_padded)
+        dist = float(np.hypot(c[0] - pc[0], c[1] - pc[1]))
+        radio = factor * max(persona.altura, 60.0)
+        if dist <= radio or iou_cajas(caja, persona.caja_padded) > 0:
+            if dist < mejor_d:
+                mejor, mejor_d = i, dist
+    return mejor
+
+
+def _cerca_de_persona(caja, contexto, factor: float = 2.4) -> bool:
+    return _indice_persona(caja, contexto, factor) is not None
+
+
+def _contexto_en(contextos, indice):
+    if not contextos or indice < 0 or indice >= len(contextos):
+        return None
+    return contextos[indice]
 
 
 def seguir_contenedores(frames, detector, cada: int, iou_min: float = 0.3,
-                        factor_centro: float = 0.8) -> list[dict]:
+                        factor_centro: float = 0.8, contextos=None) -> list[dict]:
     """Rastrea los contenedores por IoU y cercanía para tener un id estable y su último ROI."""
     if detector is None:
         return []
-    indices = list(range(0, len(frames), max(1, cada)))
-    ultimo = len(frames) - 1
-    if ultimo not in indices:
-        indices.append(ultimo)
+    cada = max(1, int(cada))
+    indices = set(range(0, len(frames), cada))
+    indices.add(len(frames) - 1)
+    if contextos is not None:
+        for i, ctx in enumerate(contextos):
+            if getattr(ctx, "personas", None):
+                indices.add(i)
     pistas: list[dict] = []
-    for indice in indices:
+    for indice in sorted(indices):
+        contexto = _contexto_en(contextos, indice)
         for det in detector.detectar(frames[indice]):
-            mejor, mejor_iou = None, -1.0
+            mejor, mejor_s = None, -1.0
+            misma_caja = False
             for pista in pistas:
                 if pista["categoria"] != det["categoria"]:
                     continue
+                accesorio = bool(det.get("accesorio") or pista.get("accesorio"))
                 if indice == pista["ultimo_frame"]:
+                    if accesorio and _cajas_cercanas(
+                        det["caja"], pista["cajas"].get(indice, pista["caja"])
+                    ):
+                        if det["score"] > pista["scores"][-1]:
+                            pista["caja"] = det["caja"]
+                            pista["cajas"][indice] = det["caja"]
+                            pista["scores"][-1] = det["score"]
+                        misma_caja = True
                     continue
-                if not _misma_pista(det["caja"], pista["caja"], iou_min, factor_centro):
-                    continue
+                hueco = indice - pista["ultimo_frame"]
+                if not _misma_pista(
+                    det["caja"], pista["caja"], iou_min, factor_centro, hueco, accesorio
+                ):
+                    if not (
+                        accesorio
+                        and hueco > 0
+                        and _indice_persona(det["caja"], contexto) is not None
+                        and _indice_persona(
+                            pista["caja"], _contexto_en(contextos, pista["ultimo_frame"])
+                        ) == _indice_persona(det["caja"], contexto)
+                    ):
+                        continue
                 iou = iou_cajas(det["caja"], pista["caja"])
-                if iou > mejor_iou:
-                    mejor, mejor_iou = pista, iou
+                score = iou + 1.0 / (1.0 + hueco)
+                if score > mejor_s:
+                    mejor, mejor_s = pista, score
+            if misma_caja:
+                continue
             if mejor is not None:
                 mejor["caja"] = det["caja"]
                 mejor["ultimo_frame"] = indice
                 mejor["scores"].append(det["score"])
                 mejor["cajas"][indice] = det["caja"]
+                mejor["accesorio"] = mejor.get("accesorio", False) or bool(det.get("accesorio"))
             else:
                 pistas.append(
                     {
@@ -717,6 +811,7 @@ def seguir_contenedores(frames, detector, cada: int, iou_min: float = 0.3,
                         "accesorio": bool(det.get("accesorio", False)),
                     }
                 )
+    pistas = _coser_accesorios(pistas, contextos)
     pistas = _unir_contenedores(pistas)
     for numero, pista in enumerate(pistas, start=1):
         pista["id"] = f"{pista['categoria']}_{numero}"
@@ -728,6 +823,81 @@ def seguir_contenedores(frames, detector, cada: int, iou_min: float = 0.3,
         + (", ".join(f"{p['id']} ({p['score_max']:.2f})" for p in pistas) or "ninguno")
     )
     return pistas
+
+
+def _hueco_pistas(a: dict, b: dict) -> int:
+    if not (a["ultimo_frame"] < b["primer_frame"] or b["ultimo_frame"] < a["primer_frame"]):
+        return 0
+    return min(abs(b["primer_frame"] - a["ultimo_frame"]), abs(a["primer_frame"] - b["ultimo_frame"]))
+
+
+def _accesorios_unibles(a: dict, b: dict, contextos=None) -> bool:
+    if a["categoria"] != b["categoria"]:
+        return False
+    area_a = max(1.0, _diagonal(a["caja"]) ** 2)
+    area_b = max(1.0, _diagonal(b["caja"]) ** 2)
+    if max(area_a, area_b) > 12.0 * min(area_a, area_b):
+        return False
+    hueco = _hueco_pistas(a, b)
+    for fa, ca in a["cajas"].items():
+        for fb, cb in b["cajas"].items():
+            salto = abs(int(fa) - int(fb))
+            if salto <= 10 and _cajas_cercanas(ca, cb):
+                return True
+            if salto <= 16 and _misma_pista(ca, cb, 0.3, 0.8, max(1, salto), True):
+                return True
+    if hueco > 24:
+        return False
+    pa = _indice_persona(a["caja"], _contexto_en(contextos, a["ultimo_frame"]))
+    pb = _indice_persona(b["caja"], _contexto_en(contextos, b["ultimo_frame"]))
+    if pa is None:
+        pa = _indice_persona(a["caja"], _contexto_en(contextos, a["primer_frame"]))
+    if pb is None:
+        pb = _indice_persona(b["caja"], _contexto_en(contextos, b["primer_frame"]))
+    return pa is not None and pa == pb
+
+
+def _fundir_pista(destino: dict, pista: dict) -> None:
+    score_in = max(pista["scores"]) if pista["scores"] else 0.0
+    score_ya = max(destino["scores"]) if destino["scores"] else 0.0
+    for frame, caja in pista["cajas"].items():
+        if frame not in destino["cajas"] or score_in > score_ya:
+            destino["cajas"][frame] = caja
+    destino["scores"].extend(pista["scores"])
+    destino["destino"] = destino.get("destino", False) or pista.get("destino", False)
+    destino["accesorio"] = destino.get("accesorio", False) or pista.get("accesorio", False)
+    destino["primer_frame"] = min(destino["primer_frame"], pista["primer_frame"])
+    if pista["ultimo_frame"] > destino["ultimo_frame"]:
+        destino["ultimo_frame"] = pista["ultimo_frame"]
+        destino["caja"] = pista["caja"]
+        destino["texto"] = pista.get("texto", destino.get("texto"))
+    elif score_in > score_ya:
+        destino["caja"] = destino["cajas"][destino["ultimo_frame"]]
+        destino["texto"] = pista.get("texto", destino.get("texto"))
+
+
+def _coser_accesorios(pistas: list[dict], contextos=None) -> list[dict]:
+    """Un bolso o mochila que camina con la persona no debe abrir un id nuevo."""
+    fijas = [p for p in pistas if not p.get("accesorio")]
+    moviles = [p for p in pistas if p.get("accesorio")]
+    if not moviles:
+        return pistas
+    moviles.sort(key=lambda p: (-max(p["scores"]), p["primer_frame"]))
+    unidas: list[dict] = []
+    for pista in moviles:
+        destino = next((ya for ya in unidas if _accesorios_unibles(ya, pista, contextos)), None)
+        if destino is None:
+            unidas.append(pista)
+            continue
+        _fundir_pista(destino, pista)
+    return fijas + unidas
+
+
+def _interpolar_caja(a, b, fa: int, fb: int, f: int):
+    if fb == fa:
+        return tuple(int(v) for v in a)
+    t = (f - fa) / float(fb - fa)
+    return tuple(int(round(x + t * (y - x))) for x, y in zip(a, b))
 
 
 def _unir_contenedores(pistas: list[dict], iou_min: float = 0.4) -> list[dict]:
@@ -774,10 +944,27 @@ def _compatibles_para_unir(a: dict, b: dict) -> bool:
     return {a["categoria"], b["categoria"]} <= {"carrito", "cesto"}
 
 
-def caja_contenedor(pista: dict, frame: int) -> tuple[int, int, int, int]:
-    """ROI del contenedor en el frame más cercano al pedido."""
-    cercano = min(pista["cajas"], key=lambda f: abs(f - frame))
-    return pista["cajas"][cercano]
+def caja_contenedor(pista: dict, frame: int, hold: int | None = None):
+    """ROI del contenedor: interpolado entre detecciones, o el más cercano.
+
+    ``hold`` limita cuántos frames se arrastra un ROI suelto (bolso que ya no
+    está ahí). Si se supera, devuelve None.
+    """
+    cajas = pista.get("cajas") or {}
+    if not cajas:
+        return None
+    if frame in cajas:
+        return cajas[frame]
+    conocidos = sorted(cajas)
+    antes = [f for f in conocidos if f <= frame]
+    despues = [f for f in conocidos if f >= frame]
+    if antes and despues:
+        fa, fb = max(antes), min(despues)
+        return _interpolar_caja(cajas[fa], cajas[fb], fa, fb, frame)
+    cercano = max(antes) if antes else min(despues)
+    if hold is not None and abs(frame - cercano) > hold:
+        return None
+    return cajas[cercano]
 
 
 def _fraccion_caja_dentro(caja, contenedor) -> float:
@@ -1109,16 +1296,14 @@ def descartar_contenedores_en_mano(contenedores, objetos, args) -> list[dict]:
     """Un bolso o una bolsa en la mano es el objeto seguido, no su contenedor."""
     vivos = []
     for pista in contenedores:
-        es_objeto = False
-        for objeto in objetos:
-            coincidencias = 0
-            comparados = 0
-            for frame, caja in pista["cajas"].items():
+        total = max(1, len(pista["cajas"]))
+        coincidencias = 0
+        for frame, caja in pista["cajas"].items():
+            area_cont = float(max(1, caja[2] - caja[0]) * max(1, caja[3] - caja[1]))
+            for objeto in objetos:
                 vista = objeto.vistas.get(frame)
                 if vista is None:
                     continue
-                comparados += 1
-                area_cont = float(max(1, caja[2] - caja[0]) * max(1, caja[3] - caja[1]))
                 area_obj = float(
                     max(1, vista.caja[2] - vista.caja[0]) * max(1, vista.caja[3] - vista.caja[1])
                 )
@@ -1127,10 +1312,10 @@ def descartar_contenedores_en_mano(contenedores, objetos, args) -> list[dict]:
                     and area_cont < args.factor_contenedor * area_obj
                 ):
                     coincidencias += 1
-            if comparados and coincidencias / comparados >= 0.5:
-                es_objeto = True
-                break
-        if es_objeto:
+                    break
+        # Frente a todas las detecciones del identificador: un solape tardío
+        # (el objeto se acerca al bolso) no debe borrar el accesorio.
+        if coincidencias / total >= 0.5:
             print(f"  {pista['id']} se descarta: es el objeto que lleva en la mano")
             continue
         vivos.append(pista)
@@ -1144,11 +1329,15 @@ def descartar_accesorios(objetos: list[Objeto], contenedores: list[dict]) -> lis
         return objetos
     vivos: list[Objeto] = []
     for objeto in objetos:
+        # Solo las primeras vistas: acercarse al bolso al final es un depósito, no identidad.
+        primeras = list(objeto.vistas.items())[:4]
         votos = 0
         comparados = 0
-        for frame, vista in objeto.vistas.items():
+        for frame, vista in primeras:
             for accesorio in accesorios:
-                caja = caja_contenedor(accesorio, frame)
+                caja = caja_contenedor(accesorio, frame, hold=6)
+                if caja is None:
+                    continue
                 comparados += 1
                 if (
                     iou_cajas(vista.caja, caja) >= 0.25
@@ -1156,7 +1345,7 @@ def descartar_accesorios(objetos: list[Objeto], contenedores: list[dict]) -> lis
                 ):
                     votos += 1
                     break
-        if comparados and votos / comparados >= 0.35:
+        if comparados and votos / comparados >= 0.5:
             print(f"  Objeto {objeto.id} se descarta: es un bolso o mochila, no va en la palma")
             continue
         vivos.append(objeto)
@@ -1507,7 +1696,16 @@ def anotar(frames, destino: Path, objetos: list[Objeto], contenedores, fps_salid
         frame = original.copy()
         orig = frame_origen(indice, indices_origen)
         for pista in contenedores:
-            x1, y1, x2, y2 = caja_contenedor(pista, indice)
+            if pista.get("accesorio"):
+                hold = 6
+            elif pista.get("destino"):
+                hold = None
+            else:
+                hold = 0
+            caja = caja_contenedor(pista, indice, hold=hold)
+            if caja is None:
+                continue
+            x1, y1, x2, y2 = caja
             color = COLOR_CONTENEDOR if pista.get("destino") else COLOR_IDENTIFICADOR
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
             cv2.putText(
@@ -1790,12 +1988,23 @@ def quedarse_con_agarrados(objetos: list[Objeto], args) -> list[Objeto]:
         candidatos.append(objeto)
     if not candidatos:
         return []
+    def mano_dom(objeto: Objeto) -> str | None:
+        votos = {"izquierda": 0, "derecha": 0, "ambas": 0}
+        for vista in objeto.vistas.values():
+            if vista.mano in votos:
+                votos[vista.mano] += 1
+        return max(votos, key=votos.get) if any(votos.values()) else None
+
     candidatos.sort(key=lambda o: -en_mano(o))
     principal = candidatos[0]
-    umbral = max(args.min_detecciones * 3, int(0.55 * en_mano(principal)))
+    umbral = max(args.min_detecciones, int(0.35 * en_mano(principal)))
+    mano_ppal = mano_dom(principal)
     vivos = [principal]
     for objeto in candidatos[1:]:
-        if en_mano(objeto) >= umbral:
+        otra_mano = mano_dom(objeto) in ("izquierda", "derecha") and mano_dom(objeto) != mano_ppal
+        if en_mano(objeto) >= umbral or (
+            otra_mano and en_mano(objeto) >= args.min_detecciones
+        ):
             vivos.append(objeto)
     for numero, objeto in enumerate(vivos, start=1):
         objeto.id = numero
@@ -1969,11 +2178,15 @@ def procesar_video(
             if not manos_visibles:
                 extra["final_state"] = "no_hands"
                 objetos = []
-                contenedores = seguir_contenedores(frames, det_contenedores, args.cada_contenedor)
+                contenedores = seguir_contenedores(
+                    frames, det_contenedores, args.cada_contenedor, contextos=contextos
+                )
                 print("  No wrists visible above min_confidence. Object model was not applied.")
             else:
                 objetos = seguir(frames, pistas, contextos, args)
-                contenedores = seguir_contenedores(frames, det_contenedores, args.cada_contenedor)
+                contenedores = seguir_contenedores(
+                    frames, det_contenedores, args.cada_contenedor, contextos=contextos
+                )
                 objetos = completar_deposito(
                     frames, objetos, contenedores, contextos, detector, sam, args
                 )
