@@ -15,7 +15,7 @@ from pipeline_manos import (
     anadir_argumentos_comunes,
     cargar_detectores,
     comprobar_entorno,
-    procesar_video,
+    procesar_lote,
     resolver_videos,
     seguir_por_deteccion,
 )
@@ -35,11 +35,12 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise SystemExit("Este script necesita una GPU CUDA.")
     detectores = cargar_detectores(args)
-    for video in resolver_videos(args):
-        procesar_video(
-            detectores, video, args, "yolo26", "YOLO26-seg",
-            "YOLO26-seg", seguir_por_deteccion,
-        )
+    fallos = procesar_lote(
+        detectores, resolver_videos(args), args, "yolo26", "YOLO26-seg",
+        "YOLO26-seg", seguir_por_deteccion,
+    )
+    if fallos:
+        raise SystemExit(fallos)
 
 
 if __name__ == "__main__":

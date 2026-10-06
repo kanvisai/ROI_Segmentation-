@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -29,7 +31,7 @@ import yaml
 
 from detector_palma.agarre import anotar_agarre, es_voluminoso, mascara_es_la_mano, puntuar_agarre
 from detector_palma.geometria import caja_desde_mascara, iou_cajas
-from detector_palma.personas import dibujar_pose
+from detector_palma.personas import ContextoEscena, dibujar_pose
 from detector_palma.tipos import Instancia
 from salida_comun import Medidor, carpeta_de, publicar_comparativa
 
@@ -95,11 +97,30 @@ class ConfigManos:
     min_confidence: float = 0.20
 
 
+def _aviso(mensaje: str) -> None:
+    print(f"  [aviso] {mensaje}", file=sys.stderr)
+
+
+def _vaciar_cuda() -> None:
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+
 def cargar_catalogo(ruta: Path) -> tuple[list[Identificador], ConfigManos]:
     """Lee identifiers.yaml (o identificadores.yaml). Acepta claves en inglés o español."""
     if not ruta.is_file():
         raise SystemExit(f"Missing identifiers YAML {ruta}")
-    datos = yaml.safe_load(ruta.read_text(encoding="utf-8")) or {}
+    try:
+        datos = yaml.safe_load(ruta.read_text(encoding="utf-8")) or {}
+    except yaml.YAMLError as exc:
+        raise SystemExit(f"YAML inválido {ruta}: {exc}") from exc
+    except OSError as exc:
+        raise SystemExit(f"No se pudo leer {ruta}: {exc}") from exc
+    if not isinstance(datos, dict):
+        raise SystemExit(f"{ruta} must be a YAML mapping.")
     bloque = datos.get("identifiers") or datos.get("identificadores")
     if not isinstance(bloque, dict) or not bloque:
         raise SystemExit(f"{ruta} has no ``identifiers`` map.")
@@ -107,7 +128,12 @@ def cargar_catalogo(ruta: Path) -> tuple[list[Identificador], ConfigManos]:
     if not isinstance(manos_raw, dict):
         manos_raw = {}
     min_conf = manos_raw.get("min_confidence", manos_raw.get("min_confianza", 0.20))
-    config_manos = ConfigManos(min_confidence=float(min_conf))
+    try:
+        min_conf = float(min_conf)
+    except (TypeError, ValueError) as exc:
+        raise SystemExit(f"hands.min_confidence inválido en {ruta}: {min_conf!r}") from exc
+    min_conf = min(1.0, max(0.0, min_conf))
+    config_manos = ConfigManos(min_confidence=min_conf)
     catalogo: list[Identificador] = []
     for clave, raw in bloque.items():
         if not isinstance(raw, dict):
@@ -178,13 +204,15 @@ def comprobar_entorno() -> None:
 
 def info_video(ruta: Path) -> tuple[int, int, int, float]:
     cap = cv2.VideoCapture(str(ruta))
-    if not cap.isOpened():
-        raise SystemExit(f"No se puede abrir el vídeo {ruta}")
-    ancho = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    alto = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    nframes = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
-    cap.release()
+    try:
+        if not cap.isOpened():
+            raise SystemExit(f"No se puede abrir el vídeo {ruta}")
+        ancho = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        alto = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        nframes = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    finally:
+        cap.release()
     if fps <= 1e-3:
         fps = 25.0
     return ancho, alto, nframes, fps
@@ -275,24 +303,26 @@ def leer_frames(
     fps_proceso: int | None = None,
 ) -> tuple[list[np.ndarray], float, list[int]]:
     cap = cv2.VideoCapture(str(video))
-    if not cap.isOpened():
-        raise SystemExit(f"No se puede abrir {video}")
-    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0) or 25.0
-    offsets, rate = offsets_muestreo(fps, fps_proceso)
-    frames: list[np.ndarray] = []
-    origen: list[int] = []
-    indice = 0
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        if offsets is None or (indice % rate) in offsets:
-            frames.append(frame)
-            origen.append(indice)
-        indice += 1
-        if max_frames is not None and indice >= max_frames:
-            break
-    cap.release()
+    try:
+        if not cap.isOpened():
+            raise SystemExit(f"No se puede abrir {video}")
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0) or 25.0
+        offsets, rate = offsets_muestreo(fps, fps_proceso)
+        frames: list[np.ndarray] = []
+        origen: list[int] = []
+        indice = 0
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if offsets is None or (indice % rate) in offsets:
+                frames.append(frame)
+                origen.append(indice)
+            indice += 1
+            if max_frames is not None and indice >= max_frames:
+                break
+    finally:
+        cap.release()
     if not frames:
         raise SystemExit(f"{video} no tiene frames")
     return frames, fps, origen
@@ -383,6 +413,8 @@ def caja_muneca(mano, padding: float, minimo: int, ancho: int, alto: int):
 
 
 def _dentro_de_caja(centro, caja, margen: float = 0.0) -> bool:
+    if centro is None or caja is None:
+        return False
     x, y = centro
     x1, y1, x2, y2 = caja
     return x1 - margen <= x <= x2 + margen and y1 - margen <= y <= y2 + margen
@@ -582,18 +614,28 @@ class DetectorIdentificadores:
         self.textos = textos
         self.yoloe = None
         if textos:
-            from ultralytics import YOLOE
-
-            if not Path(pesos_yoloe).is_file():
+            ruta_yoloe = Path(pesos_yoloe)
+            if not ruta_yoloe.is_file():
                 print(f"  Sin YOLOE: falta {pesos_yoloe}. Solo clases COCO del YAML.")
             else:
-                self.yoloe = YOLOE(str(pesos_yoloe))
-                self.yoloe.set_classes(textos, self.yoloe.get_text_pe(textos))
+                try:
+                    from ultralytics import YOLOE
+
+                    self.yoloe = YOLOE(str(ruta_yoloe))
+                    self.yoloe.set_classes(textos, self.yoloe.get_text_pe(textos))
+                except Exception as exc:
+                    self.yoloe = None
+                    _aviso(f"No se pudo cargar YOLOE ({exc}). Solo clases COCO del YAML.")
 
     def detectar(self, frame) -> list[dict]:
         salida: list[dict] = []
         if self.yolo is not None and self.ids_yolo:
-            for inst in self.yolo.detectar_clases(frame, self.ids_yolo, self.conf):
+            try:
+                detectadas = self.yolo.detectar_clases(frame, self.ids_yolo, self.conf)
+            except Exception as exc:
+                _aviso(f"YOLO de identificadores falló: {exc}")
+                detectadas = []
+            for inst in detectadas:
                 ident = self.por_id.get(int(inst.extra.get("clase_id", -1)))
                 if ident is None:
                     ident = self.por_texto.get((inst.etiqueta or "").lower())
@@ -606,21 +648,31 @@ class DetectorIdentificadores:
 
     def _detectar_yoloe(self, frame) -> list[dict]:
         alto, ancho = frame.shape[:2]
-        resultados = self.yoloe.predict(
-            frame,
-            conf=self.conf,
-            imgsz=self.imgsz,
-            device=self.dispositivo,
-            retina_masks=True,
-            verbose=False,
-        )
+        try:
+            resultados = self.yoloe.predict(
+                frame,
+                conf=self.conf,
+                imgsz=self.imgsz,
+                device=self.dispositivo,
+                retina_masks=True,
+                verbose=False,
+            )
+        except Exception as exc:
+            _aviso(f"YOLOE falló ({exc}). Se desactiva para el resto del clip.")
+            self.yoloe = None
+            _vaciar_cuda()
+            return []
         if not resultados or resultados[0].boxes is None:
             return []
         resultado = resultados[0]
-        nombres = resultado.names or self.yoloe.names
+        nombres = resultado.names or getattr(self.yoloe, "names", {}) or {}
         salida: list[dict] = []
         for caja in resultado.boxes:
-            texto = str(nombres[int(caja.cls)]).lower()
+            try:
+                cls_id = int(caja.cls)
+                texto = str(nombres.get(cls_id, nombres.get(str(cls_id), cls_id))).lower()
+            except Exception:
+                continue
             ident = self.por_texto.get(texto)
             if ident is None:
                 continue
@@ -629,8 +681,12 @@ class DetectorIdentificadores:
             x2, y2 = min(ancho, x2), min(alto, y2)
             if x2 <= x1 or y2 <= y1:
                 continue
+            try:
+                score = float(caja.conf)
+            except Exception:
+                score = 0.0
             salida.append(
-                _det_identificador(ident, texto, float(caja.conf), (x1, y1, x2, y2))
+                _det_identificador(ident, texto, score, (x1, y1, x2, y2))
             )
         return salida
 
@@ -754,7 +810,12 @@ def seguir_contenedores(frames, detector, cada: int, iou_min: float = 0.3,
     pistas: list[dict] = []
     for indice in sorted(indices):
         contexto = _contexto_en(contextos, indice)
-        for det in detector.detectar(frames[indice]):
+        try:
+            detecciones = detector.detectar(frames[indice])
+        except Exception as exc:
+            _aviso(f"frame {indice}: identificadores fallaron ({exc})")
+            continue
+        for det in detecciones:
             mejor, mejor_s = None, -1.0
             misma_caja = False
             for pista in pistas:
@@ -765,10 +826,13 @@ def seguir_contenedores(frames, detector, cada: int, iou_min: float = 0.3,
                     if accesorio and _cajas_cercanas(
                         det["caja"], pista["cajas"].get(indice, pista["caja"])
                     ):
-                        if det["score"] > pista["scores"][-1]:
+                        if det["score"] > (pista["scores"][-1] if pista["scores"] else -1.0):
                             pista["caja"] = det["caja"]
                             pista["cajas"][indice] = det["caja"]
-                            pista["scores"][-1] = det["score"]
+                            if pista["scores"]:
+                                pista["scores"][-1] = det["score"]
+                            else:
+                                pista["scores"].append(det["score"])
                         misma_caja = True
                     continue
                 hueco = indice - pista["ultimo_frame"]
@@ -872,7 +936,9 @@ def _fundir_pista(destino: dict, pista: dict) -> None:
         destino["caja"] = pista["caja"]
         destino["texto"] = pista.get("texto", destino.get("texto"))
     elif score_in > score_ya:
-        destino["caja"] = destino["cajas"][destino["ultimo_frame"]]
+        destino["caja"] = destino["cajas"].get(
+            destino["ultimo_frame"], destino.get("caja", pista.get("caja"))
+        )
         destino["texto"] = pista.get("texto", destino.get("texto"))
 
 
@@ -882,7 +948,7 @@ def _coser_accesorios(pistas: list[dict], contextos=None) -> list[dict]:
     moviles = [p for p in pistas if p.get("accesorio")]
     if not moviles:
         return pistas
-    moviles.sort(key=lambda p: (-max(p["scores"]), p["primer_frame"]))
+    moviles.sort(key=lambda p: (-max(p["scores"] or [0.0]), p["primer_frame"]))
     unidas: list[dict] = []
     for pista in moviles:
         destino = next((ya for ya in unidas if _accesorios_unibles(ya, pista, contextos)), None)
@@ -902,7 +968,7 @@ def _interpolar_caja(a, b, fa: int, fb: int, f: int):
 
 def _unir_contenedores(pistas: list[dict], iou_min: float = 0.4) -> list[dict]:
     """El mismo mueble puede salir como carrito y como cesto: gana el de más score."""
-    pistas = sorted(pistas, key=lambda p: -max(p["scores"]))
+    pistas = sorted(pistas, key=lambda p: -max(p["scores"] or [0.0]))
     unidas: list[dict] = []
     for pista in pistas:
         destino = None
@@ -968,6 +1034,8 @@ def caja_contenedor(pista: dict, frame: int, hold: int | None = None):
 
 
 def _fraccion_caja_dentro(caja, contenedor) -> float:
+    if caja is None or contenedor is None:
+        return 0.0
     x1, y1, x2, y2 = caja
     area = float(max(1, x2 - x1) * max(1, y2 - y1))
     cx1, cy1, cx2, cy2 = contenedor
@@ -980,6 +1048,8 @@ def _fraccion_caja_dentro(caja, contenedor) -> float:
 
 def _objeto_en_contenedor(vista: Vista, caja_cont) -> tuple[float, bool]:
     """Fracción del ROI del objeto dentro del contenedor, y si el centro cae dentro."""
+    if caja_cont is None:
+        return 0.0, False
     fraccion = _fraccion_caja_dentro(vista.caja, caja_cont)
     centro_dentro = _dentro_de_caja(vista.centro, caja_cont)
     return fraccion, centro_dentro
@@ -993,7 +1063,7 @@ def _destinos_deposito(contenedores) -> list[dict]:
 
 
 def _mano_en_caja(contexto, caja, margen: float = 40.0) -> bool:
-    if contexto is None:
+    if contexto is None or caja is None:
         return False
     for mano in getattr(contexto, "manos", []) or []:
         palma = mano.palma or mano.punto
@@ -1018,6 +1088,8 @@ def contenedor_final(vistas: list[Vista], contenedores: list[dict], args,
     margen_px = 80.0
 
     def candidato(pista, caja, fraccion, centro_dentro, frames_eval=1):
+        if caja is None:
+            return None
         return {
             "id": pista["id"],
             "category": pista["categoria"],
@@ -1040,9 +1112,13 @@ def contenedor_final(vistas: list[Vista], contenedores: list[dict], args,
     mejor_cerca = None
     for pista in destinos:
         caja = caja_contenedor(pista, ultima.frame)
+        if caja is None:
+            continue
         fraccion, centro_dentro = _objeto_en_contenedor(ultima, caja)
         cerca = centro_dentro or _dentro_de_caja(ultima.centro, caja, margen=margen_px)
         item = candidato(pista, caja, fraccion, centro_dentro)
+        if item is None:
+            continue
         if centro_dentro or fraccion >= umbral_suave:
             if mejor_dentro is None or item["fraction_inside"] > mejor_dentro["fraction_inside"]:
                 mejor_dentro = item
@@ -1073,6 +1149,8 @@ def contenedor_final(vistas: list[Vista], contenedores: list[dict], args,
             continue
         caja = caja_contenedor(pista, ultima.frame)
         item = candidato(pista, caja, media, _dentro_de_caja(ultima.centro, caja), len(fracs))
+        if item is None:
+            continue
         if mejor is None or item["fraction_inside"] > mejor["fraction_inside"]:
             mejor = item
     if mejor is not None:
@@ -1088,12 +1166,14 @@ def contenedor_final(vistas: list[Vista], contenedores: list[dict], args,
             if not cerca or not mano_despues(pista):
                 continue
             caja = caja_contenedor(pista, len(contextos) - 1)
-            return candidato(
+            item = candidato(
                 pista, caja,
                 max(_fraccion_caja_dentro(ultima.caja, caja), 0.5),
                 True,
                 max(1, len(contextos) - ultima.frame),
             )
+            if item is not None:
+                return item
     return None
 
 
@@ -1144,13 +1224,24 @@ def detectar_objetos(frames, escena, detector, sam, args):
     pistas: list[dict] = []
     total = 0
     for indice, frame in enumerate(frames):
-        contexto = escena.analizar(frame)
+        try:
+            contexto = escena.analizar(frame)
+        except Exception as exc:
+            _aviso(f"frame {indice}: pose/manos falló ({exc})")
+            alto, ancho = frame.shape[:2]
+            contexto = ContextoEscena(ancho=ancho, alto=alto)
         contextos.append(contexto)
         if not contexto.manos:
             if indice % 20 == 0:
                 print(f"    frame {indice}: wrists below min_confidence, object model skipped")
             continue
-        for inst, agarre in objetos_del_frame(frame, contexto, detector, sam, args):
+        try:
+            hallados = objetos_del_frame(frame, contexto, detector, sam, args)
+        except Exception as exc:
+            _aviso(f"frame {indice}: detección en muñeca falló ({exc})")
+            _vaciar_cuda()
+            continue
+        for inst, agarre in hallados:
             total += 1
             centro = inst.centro
             mejor, mejor_d = None, 1e9
@@ -1422,6 +1513,8 @@ def fusionar_objetos(objetos: list[Objeto], comunes_min: int = 3, solape_min: fl
 def trazar(objeto: Objeto, contextos, pista: dict, args) -> None:
     """Rellena la traza por frame: caja, centro, área y mano que lo sostiene."""
     for idx in sorted(objeto.mascaras):
+        if idx < 0 or idx >= len(contextos):
+            continue
         mascara = objeto.mascaras[idx]
         caja = caja_desde_mascara(mascara)
         if caja is None:
@@ -1442,6 +1535,8 @@ def trazar(objeto: Objeto, contextos, pista: dict, args) -> None:
 
 def _registrar_mascara(objeto: Objeto, indice: int, mascara, contextos, args,
                        origen: str = "deteccion") -> None:
+    if indice < 0 or indice >= len(contextos):
+        return
     caja = caja_desde_mascara(mascara)
     if caja is None:
         return
@@ -1511,8 +1606,10 @@ def completar_deposito(frames, objetos, contenedores, contextos, detector, sam, 
         return objetos
     activos = [o for o in objetos if o.vistas]
     for indice, frame in enumerate(frames):
+        if indice >= len(contextos):
+            break
         ctx = contextos[indice]
-        cajas = [caja_contenedor(p, indice) for p in destinos]
+        cajas = [caja for p in destinos if (caja := caja_contenedor(p, indice)) is not None]
         if not any(_mano_en_caja(ctx, caja, margen=50) for caja in cajas):
             continue
         pendientes = []
@@ -1526,6 +1623,8 @@ def completar_deposito(frames, objetos, contenedores, contextos, detector, sam, 
         if not pendientes:
             continue
         for caja in cajas:
+            if caja is None:
+                continue
             def _dist_obj(objeto, caja=caja, indice=indice):
                 vista = objeto.vistas[max(f for f in objeto.vistas if f <= indice)]
                 cx = 0.5 * (caja[0] + caja[2])
@@ -1535,9 +1634,13 @@ def completar_deposito(frames, objetos, contenedores, contextos, detector, sam, 
             pendientes.sort(key=_dist_obj)
             objeto = pendientes[0]
             vista = objeto.vistas[max(f for f in objeto.vistas if f <= indice)]
-            inst = _detectar_en_deposito(
-                frame, ctx, detector, sam, caja, args, vista.area, vista.centro,
-            )
+            try:
+                inst = _detectar_en_deposito(
+                    frame, ctx, detector, sam, caja, args, vista.area, vista.centro,
+                )
+            except Exception as exc:
+                _aviso(f"frame {indice}: depósito falló ({exc})")
+                continue
             if inst is None:
                 continue
             dist = float(
@@ -1690,66 +1793,83 @@ def anotar(frames, destino: Path, objetos: list[Objeto], contenedores, fps_salid
     escritor = cv2.VideoWriter(
         str(destino), cv2.VideoWriter_fourcc(*"mp4v"), fps_salida or 25.0, (ancho, alto)
     )
+    if not escritor.isOpened():
+        _aviso(f"no se pudo crear el vídeo {destino}; se escriben solo frames si aplica")
+        escritor = None
     if carpeta_frames is not None:
         carpeta_frames.mkdir(parents=True, exist_ok=True)
-    for indice, original in enumerate(frames):
-        frame = original.copy()
-        orig = frame_origen(indice, indices_origen)
-        for pista in contenedores:
-            if pista.get("accesorio"):
-                hold = 6
-            elif pista.get("destino"):
-                hold = None
-            else:
-                hold = 0
-            caja = caja_contenedor(pista, indice, hold=hold)
-            if caja is None:
-                continue
-            x1, y1, x2, y2 = caja
-            color = COLOR_CONTENEDOR if pista.get("destino") else COLOR_IDENTIFICADOR
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(
-                frame, pista["id"], (x1 + 4, max(18, y1 - 8)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA,
+    escritos = 0
+    try:
+        for indice, original in enumerate(frames):
+            frame = original.copy()
+            orig = frame_origen(indice, indices_origen)
+            for pista in contenedores:
+                if pista.get("accesorio"):
+                    hold = 6
+                elif pista.get("destino"):
+                    hold = None
+                else:
+                    hold = 0
+                caja = caja_contenedor(pista, indice, hold=hold)
+                if caja is None:
+                    continue
+                x1, y1, x2, y2 = caja
+                color = COLOR_CONTENEDOR if pista.get("destino") else COLOR_IDENTIFICADOR
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                cv2.putText(
+                    frame, pista["id"], (x1 + 4, max(18, y1 - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA,
+                )
+            for objeto in objetos:
+                vista, mascara = _overlay_objeto(objeto, indice, contenedores)
+                if vista is None or mascara is None:
+                    continue
+                if mascara.ndim != 2 or mascara.shape[:2] != frame.shape[:2]:
+                    continue
+                color = COLOR_OBJETO[(objeto.id - 1) % len(COLOR_OBJETO)]
+                try:
+                    frame[mascara] = (
+                        (1.0 - alfa) * frame[mascara] + alfa * np.array(color, dtype=np.float32)
+                    ).astype(np.uint8)
+                except Exception as exc:
+                    _aviso(f"frame {orig}: overlay de objeto {objeto.id} falló ({exc})")
+                x1, y1, x2, y2 = vista.caja
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                cv2.putText(
+                    frame,
+                    f"obj {objeto.id} {_etiqueta_mano(vista.mano)} {vista.score:.2f}",
+                    (x1, max(16, y1 - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA,
+                )
+            if dibujar_esqueleto and contextos is not None and indice < len(contextos):
+                try:
+                    dibujar_pose(frame, contextos[indice])
+                except Exception as exc:
+                    _aviso(f"frame {orig}: esqueleto falló ({exc})")
+            cv2.rectangle(frame, (0, 0), (ancho, 34), (0, 0, 0), -1)
+            activos = sum(
+                1 for o in objetos
+                if _overlay_objeto(o, indice, contenedores)[0] is not None
             )
-        for objeto in objetos:
-            vista, mascara = _overlay_objeto(objeto, indice, contenedores)
-            if vista is None or mascara is None:
-                continue
-            color = COLOR_OBJETO[(objeto.id - 1) % len(COLOR_OBJETO)]
-            frame[mascara] = (
-                (1.0 - alfa) * frame[mascara] + alfa * np.array(color, dtype=np.float32)
-            ).astype(np.uint8)
-            x1, y1, x2, y2 = vista.caja
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            t = orig / fps_video if fps_video else 0.0
             cv2.putText(
                 frame,
-                f"obj {objeto.id} {_etiqueta_mano(vista.mano)} {vista.score:.2f}",
-                (x1, max(16, y1 - 6)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA,
+                f"frame {orig}  t={t:.2f}s  handheld objects: {activos}",
+                (12, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (240, 240, 240), 1, cv2.LINE_AA,
             )
-        if dibujar_esqueleto and contextos is not None and indice < len(contextos):
-            dibujar_pose(frame, contextos[indice])
-        cv2.rectangle(frame, (0, 0), (ancho, 34), (0, 0, 0), -1)
-        activos = sum(
-            1 for o in objetos
-            if _overlay_objeto(o, indice, contenedores)[0] is not None
-        )
-        t = orig / fps_video if fps_video else 0.0
-        cv2.putText(
-            frame,
-            f"frame {orig}  t={t:.2f}s  handheld objects: {activos}",
-            (12, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (240, 240, 240), 1, cv2.LINE_AA,
-        )
-        escritor.write(frame)
-        if carpeta_frames is not None:
-            cv2.imwrite(
-                str(carpeta_frames / f"frame_{orig:05d}.jpg"),
-                frame,
-                [int(cv2.IMWRITE_JPEG_QUALITY), 95],
-            )
-    escritor.release()
-    return len(frames)
+            if escritor is not None:
+                escritor.write(frame)
+            if carpeta_frames is not None:
+                cv2.imwrite(
+                    str(carpeta_frames / f"frame_{orig:05d}.jpg"),
+                    frame,
+                    [int(cv2.IMWRITE_JPEG_QUALITY), 95],
+                )
+            escritos += 1
+    finally:
+        if escritor is not None:
+            escritor.release()
+    return escritos
 
 
 # --------------------------------------------------------------------------- #
@@ -1857,8 +1977,9 @@ def resumen(video: Path, informes: list[dict], contenedores, nframes: int, model
             if pista.get("accesorio"):
                 extra.append("accessory")
             sufijo = f" [{', '.join(extra)}]" if extra else ""
+            roi = list(pista["caja"]) if pista.get("caja") is not None else []
             lineas.append(
-                f"  {pista['id']}: ROI {list(pista['caja'])}, max score {pista['score_max']:.2f}, "
+                f"  {pista['id']}: ROI {roi}, max score {pista['score_max']:.2f}, "
                 f"seen in {pista['frames_visto']} samples{sufijo}"
             )
     else:
@@ -2113,7 +2234,7 @@ def escribir_salidas(
                 "frames_seen": p["frames_visto"],
                 "destination": bool(p.get("destino", False)),
                 "accessory": bool(p.get("accesorio", False)),
-                "last_roi": list(p["caja"]),
+                "last_roi": list(p["caja"]) if p.get("caja") is not None else [],
                 "rois": {str(orig(f)): list(c) for f, c in sorted(p["cajas"].items())},
             }
             for p in contenedores
@@ -2125,7 +2246,7 @@ def escribir_salidas(
             if clave not in traza or traza[clave] is None:
                 traza[clave] = valor
     (destino / "tracking.json").write_text(
-        json.dumps(traza, ensure_ascii=False, indent=2), encoding="utf-8"
+        json.dumps(traza, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
     )
     texto = resumen(
         video, informes, contenedores, nframes, modelo, args.identificadores, muestreo,
@@ -2133,7 +2254,7 @@ def escribir_salidas(
     )
     (destino / "summary.txt").write_text(texto, encoding="utf-8")
     (destino / "metrics.json").write_text(
-        json.dumps(metricas, ensure_ascii=False, indent=2), encoding="utf-8"
+        json.dumps(metricas, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
     )
     frames_con_objeto = len({i for o in objetos for i in o.vistas})
     desapariciones = sum(
@@ -2156,20 +2277,23 @@ def procesar_video(
     modelo: str,
     seguir,
     extra: dict | None = None,
-) -> None:
-    ancho, alto, nframes_archivo, fps_archivo = info_video(video)
-    frames, fps, indices_origen = leer_frames(video, args.max_frames, args.fps)
-    fps = fps_archivo or fps
-    nframes_origen = nframes_archivo
-    if args.max_frames is not None:
-        nframes_origen = min(nframes_origen, args.max_frames)
-    muestreo = describir_muestreo(args.fps, fps, nframes_origen, len(frames))
-    print(f"\n=== {video.name}: {ancho}x{alto}, {len(frames)} frames procesados, {fps:.3f} fps ===")
-    print(f"  {muestreo['description']}")
-    destino = carpeta_de(args.salida, tecnologia, video)
+) -> bool:
+    """Procesa un clip. Devuelve True si las salidas se escribieron."""
+    destino = None
+    frames: list = []
     medidor = Medidor(tecnologia)
     extra = dict(extra or {})
     try:
+        ancho, alto, nframes_archivo, fps_archivo = info_video(video)
+        frames, fps, indices_origen = leer_frames(video, args.max_frames, args.fps)
+        fps = fps_archivo or fps
+        nframes_origen = nframes_archivo
+        if args.max_frames is not None:
+            nframes_origen = min(nframes_origen, args.max_frames)
+        muestreo = describir_muestreo(args.fps, fps, nframes_origen, len(frames))
+        print(f"\n=== {video.name}: {ancho}x{alto}, {len(frames)} frames procesados, {fps:.3f} fps ===")
+        print(f"  {muestreo['description']}")
+        destino = carpeta_de(args.salida, tecnologia, video)
         escena, detector, sam, det_contenedores = detectores
         with medidor.etapa("segmentacion"):
             contextos, pistas = detectar_objetos(frames, escena, detector, sam, args)
@@ -2183,7 +2307,12 @@ def procesar_video(
                 )
                 print("  No wrists visible above min_confidence. Object model was not applied.")
             else:
-                objetos = seguir(frames, pistas, contextos, args)
+                try:
+                    objetos = seguir(frames, pistas, contextos, args)
+                except Exception as exc:
+                    _aviso(f"{video.name}: el seguidor de máscara falló ({exc})")
+                    traceback.print_exc()
+                    objetos = objetos_desde_pistas(pistas, contextos, args) if pistas else []
                 contenedores = seguir_contenedores(
                     frames, det_contenedores, args.cada_contenedor, contextos=contextos
                 )
@@ -2193,17 +2322,51 @@ def procesar_video(
                 objetos = descartar_accesorios(objetos, contenedores)
                 objetos = quedarse_con_agarrados(objetos, args)
                 contenedores = descartar_contenedores_en_mano(contenedores, objetos, args)
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
         escribir_salidas(
             video, args, destino, objetos, contenedores, contextos, frames, indices_origen,
             medidor.cerrar(len(frames)),
             fps, len(frames), nframes_origen, ancho, alto, tecnologia, backend, modelo, extra,
         )
-    except Exception as exc:
-        publicar_comparativa(
-            args.salida, tecnologia, video.stem, backend, destino,
-            medidor.cerrar(len(frames)), 0, 0, 0, ok=False, codigo=1, error=str(exc),
-        )
+        return True
+    except KeyboardInterrupt:
         raise
+    except (Exception, SystemExit) as exc:
+        mensaje = str(exc) or exc.__class__.__name__
+        _aviso(f"{video.name} falló: {mensaje}")
+        traceback.print_exc()
+        if destino is None:
+            try:
+                destino = carpeta_de(args.salida, tecnologia, video)
+            except Exception:
+                destino = args.salida / tecnologia / video.stem
+        try:
+            publicar_comparativa(
+                args.salida, tecnologia, video.stem, backend, destino,
+                medidor.cerrar(len(frames)), 0, 0, 0, ok=False, codigo=1, error=mensaje,
+            )
+        except Exception as extra_exc:
+            _aviso(f"no se pudo actualizar la comparativa ({extra_exc})")
+        return False
+    finally:
+        _vaciar_cuda()
+
+
+def procesar_lote(
+    detectores,
+    videos: list[Path],
+    args,
+    tecnologia: str,
+    backend: str,
+    modelo: str,
+    seguir,
+    extra: dict | None = None,
+) -> int:
+    """Procesa varios clips. Un fallo no aborta el resto. Devuelve cuántos fallaron."""
+    fallos = 0
+    for video in videos:
+        if not procesar_video(
+            detectores, video, args, tecnologia, backend, modelo, seguir, extra
+        ):
+            fallos += 1
+    return fallos
 

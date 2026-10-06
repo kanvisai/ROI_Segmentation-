@@ -23,7 +23,7 @@ from pipeline_manos import (
     comprobar_entorno,
     componente_cercana,
     fusionar_objetos,
-    procesar_video,
+    procesar_lote,
     puntuar_manos,
     resolver_videos,
     trazar,
@@ -238,17 +238,22 @@ def main() -> None:
     def seguir(frames, pistas, contextos, local_args):
         objetos = []
         for pista in pistas:
-            objeto = _propagar_una(seguidor, frames, pista, contextos, local_args)
+            try:
+                objeto = _propagar_una(seguidor, frames, pista, contextos, local_args)
+            except Exception as exc:
+                print(f"  Objeto {pista.get('id')}: Track-Anything falló ({exc})")
+                continue
             if objeto.mascaras:
                 objetos.append(objeto)
         return fusionar_objetos(objetos)
 
-    for video in resolver_videos(args):
-        procesar_video(
-            detectores, video, args, "track_anything", "Track-Anything",
-            "Track-Anything (XMem)", seguir,
-            extra={"resolucion_interna": args.resolucion_interna, "propagador": "XMem"},
-        )
+    fallos = procesar_lote(
+        detectores, resolver_videos(args), args, "track_anything", "Track-Anything",
+        "Track-Anything (XMem)", seguir,
+        extra={"resolucion_interna": args.resolucion_interna, "propagador": "XMem"},
+    )
+    if fallos:
+        raise SystemExit(fallos)
 
 
 if __name__ == "__main__":

@@ -390,10 +390,16 @@ class AnalizadorEscena:
     # -- Estrategia YOLO-pose -------------------------------------------------
 
     def _analizar_pose(self, frame: np.ndarray, contexto: ContextoEscena) -> None:
+        if self._pose is None:
+            return
         imgsz = max(self.imgsz, 960) if self.estrategia == "mediapipe" else self.imgsz
-        resultados = self._pose.predict(
-            frame, conf=self.conf, imgsz=imgsz, device=self.dispositivo, verbose=False
-        )
+        try:
+            resultados = self._pose.predict(
+                frame, conf=self.conf, imgsz=imgsz, device=self.dispositivo, verbose=False
+            )
+        except Exception as exc:
+            print(f"  [aviso] YOLO-pose falló ({exc}).")
+            return
         if not resultados:
             return
         resultado = resultados[0]
@@ -402,18 +408,24 @@ class AnalizadorEscena:
             return
 
         kps = None
-        if resultado.keypoints is not None and resultado.keypoints.data is not None:
-            kps = resultado.keypoints.data.cpu().numpy()  # (N, 17, 3)
+        try:
+            if resultado.keypoints is not None and resultado.keypoints.data is not None:
+                kps = resultado.keypoints.data.cpu().numpy()  # (N, 17, 3)
+        except Exception:
+            kps = None
 
         for i in range(len(cajas)):
-            x1, y1, x2, y2 = cajas.xyxy[i].cpu().numpy().tolist()
+            try:
+                x1, y1, x2, y2 = cajas.xyxy[i].cpu().numpy().tolist()
+            except Exception:
+                continue
             caja = (int(x1), int(y1), int(x2), int(y2))
             persona = Persona(
                 caja=caja,
                 caja_padded=expandir_caja(
                     caja, self.padding_persona, contexto.ancho, contexto.alto
                 ),
-                confianza=float(cajas.conf[i]),
+                confianza=float(cajas.conf[i]) if cajas.conf is not None else 1.0,
                 keypoints=kps[i] if kps is not None and i < len(kps) else None,
             )
             if not _tiene_cabeza(persona, self.conf_mano):

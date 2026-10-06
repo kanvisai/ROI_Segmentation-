@@ -24,7 +24,7 @@ import torch.nn.functional as F
 from pipeline_manos import (
     anadir_argumentos_comunes,
     cargar_detectores,
-    procesar_video,
+    procesar_lote,
     resolver_videos,
     seguir_por_deteccion,
 )
@@ -531,12 +531,13 @@ def main() -> None:
     args = parsear_args()
     comprobar_entorno()
     detectores = cargar_detectores(args)
-    for video in resolver_videos(args):
-        procesar_video(
-            detectores, video, args, "hoist", "HOIST-Former",
-            "HOIST-Former", seguir_por_deteccion,
-        )
+    fallos = procesar_lote(
+        detectores, resolver_videos(args), args, "hoist", "HOIST-Former",
+        "HOIST-Former", seguir_por_deteccion,
+    )
     print(f"\nListo. Resultados en {args.salida.resolve()}")
+    if fallos:
+        raise SystemExit(fallos)
 
 
 if __name__ == "__main__":

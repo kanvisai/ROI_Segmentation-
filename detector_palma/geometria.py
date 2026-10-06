@@ -26,6 +26,8 @@ def centroide(mascara: np.ndarray) -> tuple[float, float] | None:
 
 
 def iou_cajas(a: Caja, b: Caja) -> float:
+    if a is None or b is None:
+        return 0.0
     ax1, ay1, ax2, ay2 = a
     bx1, by1, bx2, by2 = b
     ix1, iy1 = max(ax1, bx1), max(ay1, by1)

@@ -26,7 +26,7 @@ from pipeline_manos import (
     comprobar_entorno,
     componente_cercana,
     fusionar_objetos,
-    procesar_video,
+    procesar_lote,
     puntuar_manos,
     resolver_videos,
     trazar,
@@ -153,17 +153,22 @@ def main() -> None:
     def seguir(frames, pistas, contextos, local_args):
         objetos = []
         for pista in pistas:
-            objeto = _propagar_una(red, frames, pista, contextos, local_args)
+            try:
+                objeto = _propagar_una(red, frames, pista, contextos, local_args)
+            except Exception as exc:
+                print(f"  Objeto {pista.get('id')}: Cutie falló ({exc})")
+                continue
             if objeto.mascaras:
                 objetos.append(objeto)
         return fusionar_objetos(objetos)
 
-    for video in resolver_videos(args):
-        procesar_video(
-            detectores, video, args, "cutie", "Cutie",
-            "Cutie", seguir,
-            extra={"resolucion_interna": args.resolucion_interna},
-        )
+    fallos = procesar_lote(
+        detectores, resolver_videos(args), args, "cutie", "Cutie",
+        "Cutie", seguir,
+        extra={"resolucion_interna": args.resolucion_interna},
+    )
+    if fallos:
+        raise SystemExit(fallos)
 
 
 if __name__ == "__main__":

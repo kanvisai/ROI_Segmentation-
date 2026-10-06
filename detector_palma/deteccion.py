@@ -90,22 +90,37 @@ class DetectorUltralytics:
         conf: float | None = None,
     ) -> list[Instancia]:
         comunes = self._comunes(conf)
-        if con_tracking and self._tracker_disponible:
-            try:
-                resultados = self.modelo.track(frame, persist=True, tracker=tracker, **comunes)
-            except ImportError as exc:
-                print(
-                    f"[aviso] El tracker de Ultralytics no esta disponible ({exc}).\n"
-                    "        Instala 'lap' (pip install lap) para usar BoT-SORT/ByteTrack.\n"
-                    "        Mientras tanto se usara solo el rastreador interno del proyecto."
-                )
-                self._tracker_disponible = False
+        try:
+            if con_tracking and self._tracker_disponible:
+                try:
+                    resultados = self.modelo.track(frame, persist=True, tracker=tracker, **comunes)
+                except ImportError as exc:
+                    print(
+                        f"[aviso] El tracker de Ultralytics no esta disponible ({exc}).\n"
+                        "        Instala 'lap' (pip install lap) para usar BoT-SORT/ByteTrack.\n"
+                        "        Mientras tanto se usara solo el rastreador interno del proyecto."
+                    )
+                    self._tracker_disponible = False
+                    resultados = self.modelo.predict(frame, **comunes)
+            else:
                 resultados = self.modelo.predict(frame, **comunes)
-        else:
-            resultados = self.modelo.predict(frame, **comunes)
+        except Exception as exc:
+            print(f"[aviso] Inferencia Ultralytics falló ({exc}).")
+            try:
+                import torch
+
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+            return []
         if not resultados:
             return []
-        return self._convertir(resultados[0], ancho, alto)
+        try:
+            return self._convertir(resultados[0], ancho, alto)
+        except Exception as exc:
+            print(f"[aviso] No se pudieron leer las detecciones ({exc}).")
+            return []
 
     def _inferir_en_personas(self, frame: np.ndarray, contexto) -> list[Instancia]:
         """Segunda pasada sobre el ROI de cada persona para objetos pequenos (tarro, bote)."""
@@ -375,7 +390,18 @@ class GeneradorMascarasSAM:
         if cajas:
             argumentos["bboxes"] = [list(map(int, c)) for c in cajas]
 
-        resultados = self.modelo(frame, **argumentos)
+        try:
+            resultados = self.modelo(frame, **argumentos)
+        except Exception as exc:
+            print(f"[aviso] SAM falló ({exc}).")
+            try:
+                import torch
+
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+            return []
         if not resultados:
             return []
         resultado = resultados[0]
