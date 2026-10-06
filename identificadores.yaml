@@ -59,3 +59,10 @@ identifiers:
     prompts:
       - cell phone
       - mobile phone
+
+  bolsillo:
+    active: true
+    destination: true
+    accessory: false
+    body: true
+    prompts: []

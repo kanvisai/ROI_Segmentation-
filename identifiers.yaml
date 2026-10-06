@@ -18,6 +18,7 @@
 #
 # destination: true  → the handheld object may end inside this ROI.
 # accessory: true    → shoulder bag / backpack: do not treat as the grasped object.
+# body: true         → ROI from pose (e.g. trouser pocket at the hip), not YOLO.
 #
 # hands.min_confidence: wrist/hand visibility threshold, applied per hand.
 # A hand below this value is not searched for objects. If no wrist is ever
@@ -81,3 +82,10 @@ identifiers:
     prompts:
       - cell phone
       - mobile phone
+
+  bolsillo:
+    active: true
+    destination: true
+    accessory: false
+    body: true
+    prompts: []

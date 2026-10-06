@@ -414,11 +414,12 @@ identifiers:
 | `prompts` | YOLOE text. Required if the class is not in COCO. |
 | `destination` | The handheld object may end inside this ROI (green). |
 | `accessory` | Shoulder bag / backpack: not merged with the grasped object. |
+| `body` | ROI from the pose (hip/thigh pocket). Not detected with YOLO. |
 | `hands.min_confidence` | Below this, wrists/hands are treated as not visible and the object model is skipped. |
 
 Ids Ultralytics COCO (contiguos 0–79), no los ids “paper” de COCO: `24` backpack, `26` handbag, `66` **keyboard**, `67` **cell phone**. El móvil es **67**. Carrito, cesto y bolsa no están en COCO: solo YOLOE.
 
-Por defecto en este repo: carrito, cesto, bolso, mochila, bolsa y celular activos. Destinos en verde; el resto (p. ej. celular) en cian.
+Por defecto en este repo: carrito, cesto, bolso, mochila, bolsa, celular y bolsillo activos. Destinos en verde; el resto (p. ej. celular) en cian. El bolsillo se estima con las caderas de la pose.
 
 ---
 
