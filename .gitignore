@@ -1,6 +1,7 @@
 # Vídeos privados: no deben subirse al repositorio.
 videos/
 videos*/
+fp_agosto/
 
 # Antiguo proyecto: no deben subirse al repositorio.
 antiguo_proyecto/
