@@ -255,10 +255,41 @@ def offsets_muestreo(fps_video: float, fps_proceso: int | None) -> tuple[set[int
     return {int(i * rate / n) for i in range(n)}, rate
 
 
-def describir_muestreo(fps_proceso, fps_video: float, n_origen: int, n_procesados: int) -> dict:
-    """Texto y metadatos de si --fps se usó o el análisis fue frame a frame."""
+def describir_muestreo(
+    fps_proceso,
+    fps_video: float,
+    n_origen: int,
+    n_procesados: int,
+    desde_frames: bool = False,
+    indices_origen: list[int] | None = None,
+) -> dict:
+    """Texto y metadatos de si --fps se usó, si llegaron arrays, o el análisis fue frame a frame."""
+    if desde_frames:
+        fps_entero = int(round(float(fps_video)))
+        indices = list(indices_origen) if indices_origen is not None else None
+        origen_txt = ""
+        if indices:
+            muestra = ", ".join(str(i) for i in indices[:8])
+            if len(indices) > 8:
+                muestra += ", …"
+            origen_txt = f" Source indices: {muestra}."
+        return {
+            "specified": True,
+            "input": "frames",
+            "fps_parameter": int(fps_proceso) if fps_proceso is not None else fps_entero,
+            "video_fps": fps_entero,
+            "integer_rate": fps_entero,
+            "source_frames": n_origen,
+            "processed_frames": n_procesados,
+            "source_indices": indices,
+            "description": (
+                f"--frames was set ({n_procesados} arrays). "
+                f"Timeline fps is {fps_entero}. No mp4 sampling was applied.{origen_txt}"
+            ),
+        }
     offsets, rate = offsets_muestreo(fps_video, fps_proceso)
     base = {
+        "input": "video",
         "video_fps": round(float(fps_video), 4),
         "integer_rate": rate,
         "source_frames": n_origen,
@@ -290,12 +321,9 @@ def describir_muestreo(fps_proceso, fps_video: float, n_origen: int, n_procesado
         f"({n_procesados} of {n_origen} frames)."
     )
     return {
+        **base,
         "specified": True,
         "fps_parameter": int(fps_proceso),
-        "video_fps": round(float(fps_video), 4),
-        "integer_rate": rate,
-        "source_frames": n_origen,
-        "processed_frames": n_procesados,
         "offsets_in_second": sorted(offsets),
         "description": descripcion,
     }
@@ -338,7 +366,95 @@ def leer_frames(
     return frames, fps, origen
 
 
+def _es_entero(valor) -> bool:
+    return isinstance(valor, (int, np.integer)) and not isinstance(valor, bool)
+
+
+def _entero_obligatorio(valor, nombre: str) -> int:
+    if valor is None:
+        raise SystemExit(f"--{nombre} is required when passing --frames")
+    if not _es_entero(valor):
+        raise SystemExit(f"--{nombre} must be an integer, got {type(valor).__name__}")
+    n = int(valor)
+    if n < 1:
+        raise SystemExit(f"--{nombre} must be an integer >= 1")
+    return n
+
+
+def _entero_indice(valor, nombre: str) -> int:
+    if not _es_entero(valor):
+        raise SystemExit(f"{nombre} must be an integer, got {type(valor).__name__}")
+    n = int(valor)
+    if n < 0:
+        raise SystemExit(f"{nombre} must be an integer >= 0")
+    return n
+
+
+def preparar_frames(
+    frames,
+    frames_origin=None,
+    fps=None,
+    width=None,
+    height=None,
+) -> tuple[list[np.ndarray], list[int], int, int, int]:
+    """Valida arrays en memoria: BGR uint8, fps/ancho/alto enteros, índices de origen."""
+    if not isinstance(frames, (list, tuple)) or not frames:
+        raise SystemExit("--frames must be a non-empty list of numpy arrays")
+    normalizados: list[np.ndarray] = []
+    for i, frame in enumerate(frames):
+        arr = np.asarray(frame)
+        if arr.ndim == 2:
+            arr = cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
+        elif arr.ndim == 3 and arr.shape[2] == 4:
+            arr = cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
+        elif arr.ndim != 3 or arr.shape[2] != 3:
+            raise SystemExit(f"--frames[{i}] must be HxW or HxWxC (1, 3 or 4 channels)")
+        if arr.dtype != np.uint8:
+            arr = np.clip(arr, 0, 255).astype(np.uint8)
+        normalizados.append(np.ascontiguousarray(arr))
+    alto_f, ancho_f = int(normalizados[0].shape[0]), int(normalizados[0].shape[1])
+    ancho = _entero_obligatorio(ancho_f if width is None else width, "width")
+    alto = _entero_obligatorio(alto_f if height is None else height, "height")
+    if width is not None and ancho != ancho_f:
+        raise SystemExit(f"--width ({ancho}) does not match frames ({ancho_f})")
+    if height is not None and alto != alto_f:
+        raise SystemExit(f"--height ({alto}) does not match frames ({alto_f})")
+    for i, arr in enumerate(normalizados):
+        if int(arr.shape[0]) != alto or int(arr.shape[1]) != ancho:
+            raise SystemExit(
+                f"--frames[{i}] is {arr.shape[1]}x{arr.shape[0]}, expected {ancho}x{alto}"
+            )
+    fps_entero = _entero_obligatorio(fps, "fps")
+    if frames_origin is None:
+        origen = list(range(len(normalizados)))
+    else:
+        if not isinstance(frames_origin, (list, tuple)):
+            raise SystemExit("--frames-origin must be a list of integers")
+        if len(frames_origin) != len(normalizados):
+            raise SystemExit("--frames-origin length must match --frames")
+        origen = [
+            _entero_indice(idx, f"--frames-origin[{i}]")
+            for i, idx in enumerate(frames_origin)
+        ]
+    return normalizados, origen, fps_entero, ancho, alto
+
+
+def _fps_salida_frames(fps: float, indices_origen: list[int]) -> float:
+    if len(indices_origen) >= 2:
+        span = int(indices_origen[-1]) - int(indices_origen[0])
+        if span > 0:
+            return max(1.0, (len(indices_origen) - 1) * float(fps) / span)
+    return float(fps)
+
+
+def entrada_en_memoria(args, frames=None) -> bool:
+    return frames is not None or getattr(args, "frames", None) is not None
+
+
 def resolver_videos(args) -> list[Path]:
+    if entrada_en_memoria(args):
+        nombre = args.video if getattr(args, "video", None) is not None else Path("frames")
+        return [Path(nombre)]
     if args.video is not None:
         if not args.video.is_file():
             raise SystemExit(f"No existe el vídeo {args.video}")
@@ -3088,8 +3204,27 @@ def resumen(video: Path, informes: list[dict], contenedores, nframes: int, model
 
 def anadir_argumentos_comunes(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--videos", type=Path, default=Path("videos"), help="Carpeta de vídeos.")
-    parser.add_argument("--video", type=Path, default=None, help="Un único vídeo. Si se indica, se ignora --videos.")
+    parser.add_argument(
+        "--video", type=Path, default=None,
+        help="Un único mp4 (opcional si args.frames / frames= es una list[np.ndarray]). "
+             "Con arrays en memoria solo nombra la carpeta de salida.",
+    )
     parser.add_argument("--salida", type=Path, default=Path("salidas"))
+    parser.add_argument(
+        "--width", type=int, default=None,
+        help="Ancho en píxeles; debe ser un entero. Con --frames es el de los arrays "
+             "(si se omite se infiere). Con mp4, si se pasa debe coincidir con el archivo.",
+    )
+    parser.add_argument(
+        "--height", type=int, default=None,
+        help="Alto en píxeles; debe ser un entero. Con --frames es el de los arrays "
+             "(si se omite se infiere). Con mp4, si se pasa debe coincidir con el archivo.",
+    )
+    parser.add_argument(
+        "--frames-origin", dest="frames_origin", nargs="+", type=int, default=None, metavar="I",
+        help="Índices de origen (enteros) de cada array en --frames. Misma longitud que la lista de frames.",
+    )
+    parser.set_defaults(frames=None)  # list[np.ndarray] BGR; API Python, no flag de shell
     parser.add_argument("--modelo-pose", type=Path, default=PESOS / "yolo26n-pose.pt")
     parser.add_argument("--modelo-objeto", type=Path, default=PESOS / "yolo26n-seg.pt")
     parser.add_argument("--modelo-contenedores", type=Path, default=PESOS / "yoloe-26m-seg.pt")
@@ -3146,9 +3281,9 @@ def anadir_argumentos_comunes(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--alfa", type=float, default=0.55)
     parser.add_argument(
         "--fps", type=int, default=None,
-        help="Frames a procesar por cada segundo de vídeo. Con un vídeo a 15 fps, "
-             "--fps 1 toma el primero de cada segundo; --fps 2 los frames 1 y 8; "
-             "--fps 3 los frames 1, 6 y 11. Si se omite, se procesa frame a frame.",
+        help="Entero. Con mp4: frames a procesar por cada segundo de vídeo "
+             "(a 15 fps, --fps 3 toma 1, 6 y 11). Con --frames: fps de la línea "
+             "temporal (obligatorio). Si se omite en mp4, se procesa frame a frame.",
     )
     parser.add_argument("--max-frames", type=int, default=None)
 
@@ -3276,13 +3411,17 @@ def escribir_salidas(
     modelo: str,
     extra: dict | None = None,
 ) -> None:
-    muestreo = describir_muestreo(args.fps, fps, nframes_origen, nframes)
+    extra = extra or {}
+    muestreo = extra.get("sampling") or describir_muestreo(args.fps, fps, nframes_origen, nframes)
     informes = [
         informe_objeto(o, fps, nframes, contenedores, args, indices_origen, contextos)
         for o in objetos
     ]
-    offsets, _rate = offsets_muestreo(fps, args.fps)
-    fps_salida = float(args.fps) if offsets is not None else fps
+    if extra.get("input") == "frames":
+        fps_salida = _fps_salida_frames(fps, indices_origen)
+    else:
+        offsets, _rate = offsets_muestreo(fps, args.fps)
+        fps_salida = float(args.fps) if offsets is not None else fps
     anotado = destino / "anotado.mp4"
     print(f"  Escribiendo {anotado}")
     escritos = anotar(
@@ -3296,24 +3435,24 @@ def escribir_salidas(
     def orig(idx: int) -> int:
         return frame_origen(idx, indices_origen)
 
-    extra = extra or {}
     if extra.get("final_state") is None:
         extra["final_state"] = _final_state_video(informes)
     pose_backend = "mediapipe" if getattr(args, "mediapipe", False) else "yolo-pose"
     traza = {
         "video": str(video),
         "model": modelo,
-        "width": ancho,
-        "height": alto,
+        "width": int(ancho),
+        "height": int(alto),
         "frames": nframes,
         "source_frames": nframes_origen,
-        "fps": fps,
+        "fps": int(fps) if extra.get("input") == "frames" else fps,
         "output_fps": fps_salida,
         "sampling": muestreo,
         "pose_backend": pose_backend,
         "hands_visible": extra.get("hands_visible", True),
         "final_state": extra.get("final_state"),
         "parameters": {
+            "input": extra.get("input", "video"),
             "wrist_padding": args.padding_muneca,
             "crop_min": args.crop_min,
             "palm_factor": args.factor_palma,
@@ -3326,7 +3465,10 @@ def escribir_salidas(
             "identifiers_yaml": str(args.identificadores),
             "hand_min_confidence": getattr(getattr(args, "config_manos", None), "min_confidence", None),
             "mediapipe": bool(getattr(args, "mediapipe", False)),
-            "fps": args.fps,
+            "fps": int(fps) if extra.get("input") == "frames" else args.fps,
+            "width": int(ancho),
+            "height": int(alto),
+            "frames_origin": list(indices_origen) if extra.get("input") == "frames" else None,
         },
         "identifiers_yaml": [
             {
@@ -3391,51 +3533,101 @@ def escribir_salidas(
 
 def procesar_video(
     detectores,
-    video: Path,
+    video: Path | None,
     args,
     tecnologia: str,
     backend: str,
     modelo: str,
     seguir,
     extra: dict | None = None,
+    *,
+    frames: list[np.ndarray] | None = None,
+    frames_origin: list[int] | None = None,
+    fps: int | None = None,
+    width: int | None = None,
+    height: int | None = None,
 ) -> bool:
-    """Procesa un clip. Devuelve True si las salidas se escribieron."""
+    """Procesa un clip (mp4 o arrays en memoria). Devuelve True si las salidas se escribieron."""
     destino = None
-    frames: list = []
+    frames_proc: list = []
     medidor = Medidor(tecnologia)
     extra = dict(extra or {})
+    if video is None:
+        video = Path(getattr(args, "video", None) or "frames")
+    else:
+        video = Path(video)
     try:
-        ancho, alto, nframes_archivo, fps_archivo = info_video(video)
-        frames, fps, indices_origen = leer_frames(video, args.max_frames, args.fps)
-        fps = fps_archivo or fps
-        nframes_origen = nframes_archivo
-        if args.max_frames is not None:
-            nframes_origen = min(nframes_origen, args.max_frames)
-        muestreo = describir_muestreo(args.fps, fps, nframes_origen, len(frames))
-        print(f"\n=== {video.name}: {ancho}x{alto}, {len(frames)} frames procesados, {fps:.3f} fps ===")
+        frames_mem = frames if frames is not None else getattr(args, "frames", None)
+        if frames_mem is not None:
+            origen_mem = (
+                frames_origin if frames_origin is not None
+                else getattr(args, "frames_origin", None)
+            )
+            fps_mem = fps if fps is not None else getattr(args, "fps", None)
+            ancho_mem = width if width is not None else getattr(args, "width", None)
+            alto_mem = height if height is not None else getattr(args, "height", None)
+            frames_proc, indices_origen, fps, ancho, alto = preparar_frames(
+                frames_mem, origen_mem, fps_mem, ancho_mem, alto_mem,
+            )
+            nframes_origen = max(indices_origen) + 1 if indices_origen else len(frames_proc)
+            extra["input"] = "frames"
+            muestreo = describir_muestreo(
+                fps, fps, nframes_origen, len(frames_proc),
+                desde_frames=True, indices_origen=indices_origen,
+            )
+        else:
+            if getattr(args, "frames_origin", None) is not None and frames_origin is None:
+                raise SystemExit("--frames-origin requires --frames (list[np.ndarray])")
+            if not video.is_file():
+                raise SystemExit(
+                    "Pass an mp4 (--video) or --frames as list[np.ndarray] "
+                    "with --fps, --width and --height as integers"
+                )
+            if width is not None or getattr(args, "width", None) is not None:
+                _entero_obligatorio(width if width is not None else args.width, "width")
+            if height is not None or getattr(args, "height", None) is not None:
+                _entero_obligatorio(height if height is not None else args.height, "height")
+            ancho, alto, nframes_archivo, fps_archivo = info_video(video)
+            frames_proc, fps, indices_origen = leer_frames(video, args.max_frames, args.fps)
+            fps = fps_archivo or fps
+            nframes_origen = nframes_archivo
+            if args.max_frames is not None:
+                nframes_origen = min(nframes_origen, args.max_frames)
+            extra["input"] = "video"
+            muestreo = describir_muestreo(args.fps, fps, nframes_origen, len(frames_proc))
+            if width is not None or getattr(args, "width", None) is not None:
+                ancho_pedido = int(width if width is not None else args.width)
+                if ancho_pedido != int(ancho):
+                    raise SystemExit(f"--width ({ancho_pedido}) does not match the mp4 ({ancho})")
+            if height is not None or getattr(args, "height", None) is not None:
+                alto_pedido = int(height if height is not None else args.height)
+                if alto_pedido != int(alto):
+                    raise SystemExit(f"--height ({alto_pedido}) does not match the mp4 ({alto})")
+        extra["sampling"] = muestreo
+        print(f"\n=== {video.name}: {ancho}x{alto}, {len(frames_proc)} frames procesados, {fps:.3f} fps ===")
         print(f"  {muestreo['description']}")
         destino = carpeta_de(args.salida, tecnologia, video)
         escena, detector, sam, det_contenedores = detectores
         with medidor.etapa("segmentacion"):
-            contextos, pistas = detectar_objetos(frames, escena, detector, sam, args)
+            contextos, pistas = detectar_objetos(frames_proc, escena, detector, sam, args)
             manos_visibles = any(bool(ctx.manos) for ctx in contextos)
             extra["hands_visible"] = manos_visibles
             if not manos_visibles:
                 extra["final_state"] = "no_hands"
                 objetos = []
                 contenedores = seguir_contenedores(
-                    frames, det_contenedores, args.cada_contenedor, contextos=contextos
+                    frames_proc, det_contenedores, args.cada_contenedor, contextos=contextos
                 )
                 print("  No wrists visible above min_confidence. Object model was not applied.")
             else:
                 try:
-                    objetos = seguir(frames, pistas, contextos, args)
+                    objetos = seguir(frames_proc, pistas, contextos, args)
                 except Exception as exc:
                     _aviso(f"{video.name}: el seguidor de máscara falló ({exc})")
                     traceback.print_exc()
                     objetos = objetos_desde_pistas(pistas, contextos, args) if pistas else []
                 contenedores = seguir_contenedores(
-                    frames, det_contenedores, args.cada_contenedor, contextos=contextos
+                    frames_proc, det_contenedores, args.cada_contenedor, contextos=contextos
                 )
                 objetos = recortar_objeto_si_salta_a_bolsa(objetos, contenedores)
                 objetos = recortar_cola_si_salta(objetos, contenedores)
@@ -3445,7 +3637,7 @@ def procesar_video(
                         contenedores, contextos, args
                     )
                 objetos = completar_deposito(
-                    frames, objetos, contenedores, contextos, detector, sam, args
+                    frames_proc, objetos, contenedores, contextos, detector, sam, args
                 )
                 objetos = descartar_accesorios(objetos, contenedores)
                 objetos = quedarse_con_agarrados(objetos, args, contenedores, contextos)
@@ -3454,9 +3646,9 @@ def procesar_video(
                 contenedores = descartar_contenedores_en_mano(contenedores, objetos, args)
                 contenedores = _filtrar_celular_fantasma(contenedores, objetos)
         escribir_salidas(
-            video, args, destino, objetos, contenedores, contextos, frames, indices_origen,
-            medidor.cerrar(len(frames)),
-            fps, len(frames), nframes_origen, ancho, alto, tecnologia, backend, modelo, extra,
+            video, args, destino, objetos, contenedores, contextos, frames_proc, indices_origen,
+            medidor.cerrar(len(frames_proc)),
+            fps, len(frames_proc), nframes_origen, ancho, alto, tecnologia, backend, modelo, extra,
         )
         return True
     except KeyboardInterrupt:
@@ -3469,11 +3661,11 @@ def procesar_video(
             try:
                 destino = carpeta_de(args.salida, tecnologia, video)
             except Exception:
-                destino = args.salida / tecnologia / video.stem
+                destino = args.salida / tecnologia / Path(video).stem
         try:
             publicar_comparativa(
                 args.salida, tecnologia, video.stem, backend, destino,
-                medidor.cerrar(len(frames)), 0, 0, 0, ok=False, codigo=1, error=mensaje,
+                medidor.cerrar(len(frames_proc)), 0, 0, 0, ok=False, codigo=1, error=mensaje,
             )
         except Exception as extra_exc:
             _aviso(f"no se pudo actualizar la comparativa ({extra_exc})")
@@ -3484,19 +3676,39 @@ def procesar_video(
 
 def procesar_lote(
     detectores,
-    videos: list[Path],
+    videos: list[Path] | None,
     args,
     tecnologia: str,
     backend: str,
     modelo: str,
     seguir,
     extra: dict | None = None,
+    *,
+    frames: list[np.ndarray] | None = None,
+    frames_origin: list[int] | None = None,
+    fps: int | None = None,
+    width: int | None = None,
+    height: int | None = None,
 ) -> int:
-    """Procesa varios clips. Un fallo no aborta el resto. Devuelve cuántos fallaron."""
+    """Procesa varios clips o una lista de arrays. Un fallo no aborta el resto."""
+    if frames is not None:
+        args.frames = frames
+        if frames_origin is not None:
+            args.frames_origin = frames_origin
+        if fps is not None:
+            args.fps = fps
+        if width is not None:
+            args.width = width
+        if height is not None:
+            args.height = height
+        videos = resolver_videos(args)
+    elif not videos:
+        videos = resolver_videos(args)
     fallos = 0
     for video in videos:
         if not procesar_video(
-            detectores, video, args, tecnologia, backend, modelo, seguir, extra
+            detectores, video, args, tecnologia, backend, modelo, seguir, extra,
+            frames=frames, frames_origin=frames_origin, fps=fps, width=width, height=height,
         ):
             fallos += 1
     return fallos

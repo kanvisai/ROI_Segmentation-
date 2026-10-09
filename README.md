@@ -13,7 +13,7 @@ Un agente o un servicio externo puede reutilizar el repo entero o solo el pipeli
 | Python | 3.11 o superior. El venv del repo es 3.12.13. |
 | GPU | NVIDIA con CUDA 12+. PyTorch informa CUDA 12.8. Sin GPU los scripts abortan. |
 | Intérprete | `.venv/bin/python` desde la raíz del repo. |
-| Vídeos | Carpeta `videos/` (gitignored). Extensiones: `.mp4`, `.mov`, `.avi`, `.mkv`, `.webm`. |
+| Vídeos | Carpeta `videos/` (gitignored). Extensiones: `.mp4`, `.mov`, `.avi`, `.mkv`, `.webm`. El mp4 es **opcional** si se pasa `list[np.ndarray]` (`frames=` / `args.frames`). |
 | Pesos | Carpeta `pesos/` (gitignored salvo que alguien deje un `.gitkeep`). |
 | Terceros | `third_party/` (gitignored): clones de Cutie, XMem/Track-Anything, HOIST, VISOR-HOS, envoltorio nvcc. |
 | Salidas | `salidas/<tecnologia>/<stem_del_clip>/` más `salidas/comparativa/`. |
@@ -28,8 +28,8 @@ from pipeline_manos import (
     anadir_argumentos_comunes,
     cargar_detectores,
     comprobar_entorno,
-    procesar_lote,          # varios clips; un fallo no aborta el resto
-    procesar_video,         # un clip
+    procesar_lote,          # varios clips o frames=list[np.ndarray]
+    procesar_video,         # un clip (mp4 o arrays)
     resolver_videos,
     seguir_por_deteccion,   # redetectar cada frame; o pasar un `seguir` propio
 )
@@ -93,7 +93,9 @@ ROI_Segmentation-/
 ## Arquitectura
 
 ```
-vídeo --leer_frames(--fps)--> frames BGR + indices_origen
+mp4 --leer_frames(--fps)--> frames BGR + indices_origen
+  o
+list[np.ndarray] + frames_origin + fps/width/height (enteros)
         |
         v
 cargar_detectores(args)
@@ -120,8 +122,9 @@ Funciones clave de `pipeline_manos.py` para un integrador:
 
 | Función | Papel |
 |---|---|
-| `anadir_argumentos_comunes(parser)` | CLI compartida (`--videos`, `--video`, `--fps`, YAML, umbrales…). |
-| `resolver_videos(args)` | Un archivo (`--video`) o todos los de `--videos`. |
+| `anadir_argumentos_comunes(parser)` | CLI compartida (`--videos`, `--video`, `--fps`, `--width`, `--height`, `--frames-origin`, YAML…). |
+| `resolver_videos(args)` | Un archivo (`--video`), todos los de `--videos`, o un stem ficticio si hay `args.frames`. |
+| `preparar_frames(frames, frames_origin, fps, width, height)` | Valida `list[np.ndarray]` BGR, índices enteros y `fps`/`width`/`height` enteros. |
 | `cargar_catalogo(ruta)` / `Identificador` | Lectura de `identifiers.yaml` (acepta claves en inglés o español). |
 | `cargar_detectores(args)` | Devuelve `(escena, detector, sam, identificadores)`. Con `--mediapipe` la escena usa Holistic. |
 | `leer_frames(video, max_frames, fps_proceso)` | `(frames, fps, indices_origen)`. |
@@ -130,8 +133,8 @@ Funciones clave de `pipeline_manos.py` para un integrador:
 | `seguir_por_deteccion(...)` | Backend nulo: la máscara de cada frame es la del detector. |
 | `fusionar_objetos(...)` | Une dos pistas de la misma pieza (p. ej. las dos manos sobre una botella). |
 | `contenedor_final(...)` | Destino del último frame: mueble primero, bolsillo solo con gesto. |
-| `procesar_video(...)` | Orquesta un clip. Captura fallos del seguidor y sigue con las pistas. |
-| `procesar_lote(...)` | Varios clips; un fallo no aborta el resto. Devuelve cuántos fallaron. |
+| `procesar_video(...)` | Orquesta un clip (mp4 o arrays). Kwargs: `frames`, `frames_origin`, `fps`, `width`, `height`. |
+| `procesar_lote(...)` | Varios clips o una lista de arrays; un fallo no aborta el resto. Devuelve cuántos fallaron. |
 | `escribir_salidas(...)` | JSON + vídeo + comparativa. |
 | `Objeto`, `Vista` | Tipos de la traza. |
 
@@ -318,12 +321,15 @@ Todos salvo VISOR llaman a `anadir_argumentos_comunes`. VISOR replica `--videos`
 | Flag | Default | Significado |
 |---|---|---|
 | `--videos` | `videos` | Carpeta de clips. |
-| `--video` | ninguno | Un solo archivo; ignora `--videos`. |
+| `--video` | ninguno | Un solo mp4 (opcional si hay `frames`). Con arrays solo nombra la carpeta de salida. |
+| `--frames` | ninguno | **API Python**, no flag de shell: `list[np.ndarray]` BGR (`args.frames` o `frames=`). Si está definida, el mp4 no hace falta. |
+| `--frames-origin` | `0…N-1` | `list[int]`: índice de origen de cada array. Misma longitud que `--frames`. |
+| `--width` / `--height` | se infieren del array | Enteros ≥ 1. Con arrays son el tamaño; si se pasan deben coincidir. Con mp4, si se pasan deben coincidir con el archivo. |
 | `--salida` | `salidas` | Raíz de resultados. |
 | `--identificadores` | `identifiers.yaml` | Catálogo de escena + `hands.min_confidence`. |
 | `--mediapipe` | off | MediaPipe Holistic (pose + manos) en el recorte de persona, en lugar de YOLO-pose. Rechaza mejor la mano vacía. El umbral de muñecas es `hands.min_confidence` (0.20). |
-| `--fps N` | omitido = frame a frame | Ver [Muestreo `--fps`](#muestreo---fps). |
-| `--max-frames` | ninguno | Corta la lectura del vídeo de origen (antes del muestreo). |
+| `--fps N` | omitido = frame a frame (solo mp4) | Entero. Con mp4: muestreo. Con `--frames`: fps de la línea temporal (**obligatorio**). Ver [Muestreo `--fps`](#muestreo---fps). |
+| `--max-frames` | ninguno | Corta la lectura del vídeo de origen (antes del muestreo). No aplica a arrays en memoria. |
 | `--sin-sam` | off | No usa MobileSAM. |
 | `--sin-contenedores` | off | Ignora el YAML. |
 | `--sin-frames` | off | No vuelca JPEG sueltos. |
@@ -370,7 +376,14 @@ Prueba corta recomendada:
 
 ## Muestreo `--fps`
 
-`--fps N` pide **N frames por cada segundo de vídeo**, no un stride uniforme.
+`--fps` es un **entero** ≥ 1. El significado depende de la entrada:
+
+| Entrada | `--fps N` | Si se omite |
+|---|---|---|
+| mp4 | **N frames por cada segundo de vídeo**, no un stride uniforme | Frame a frame |
+| `list[np.ndarray]` | Fps de la **línea temporal** (obligatorio). No se vuelve a muestrear | Error |
+
+### mp4
 
 `rate = round(fps_del_video)`. Offsets dentro de cada segundo: `{int(i * rate / N) for i in range(N)}` (0-index). Ejemplos con vídeo a **15 fps**:
 
@@ -380,17 +393,58 @@ Prueba corta recomendada:
 | `--fps 2` | 0, 7 | 1 y 8 |
 | `--fps 3` | 0, 5, 10 | 1, 6 y 11 |
 
-Si `--fps` se omite, o si `N >= rate`, el procesamiento es **frame a frame**.
+Si `N >= rate`, el procesamiento es **frame a frame**.
 
 El seguimiento interno usa índices 0…M−1 de los frames **procesados**. JSON, HUD y nombres `frames/frame_XXXXX.jpg` se remapean al índice **original** del archivo (`t = orig / fps_video`). El `anotado.mp4` se escribe a `N` fps cuando hay muestreo, para conservar la duración.
 
-Consola, `summary.txt` y `tracking.json["sampling"]` declaran siempre una de estas tres:
+`--max-frames` limita frames de **origen** leídos, y después se aplica el muestreo.
+
+### Arrays en memoria (`--frames`)
+
+No se puede pasar `list[np.ndarray]` por la shell. En Python:
+
+```python
+from pipeline_manos import (
+    anadir_argumentos_comunes, cargar_detectores, procesar_video, seguir_por_deteccion,
+)
+import argparse
+
+parser = argparse.ArgumentParser()
+anadir_argumentos_comunes(parser)
+args = parser.parse_args([
+    "--salida", "salidas",
+    "--fps", "15",           # entero: fps de la línea temporal
+    "--width", "1280",       # entero
+    "--height", "720",       # entero
+    "--frames-origin", "0", "5", "10",
+    "--video", "clip_memoria",  # opcional: stem de salidas/<tecnologia>/clip_memoria/
+])
+args.frames = frames_bgr          # list[np.ndarray], HxWx3 uint8
+# equivalente a kwargs:
+detectores = cargar_detectores(args)
+procesar_video(
+    detectores, None, args, "yolo26", "deteccion", "yolo26n-seg",
+    seguir_por_deteccion,
+    frames=frames_bgr,           # list[np.ndarray]
+    frames_origin=[0, 5, 10],    # list[int], misma longitud
+    fps=15,                      # int
+    width=1280,                  # int
+    height=720,                  # int
+)
+```
+
+`width` y `height` deben ser enteros. Si se omiten, se leen del primer array y se comprueba que todos coincidan. Si se pasan, tienen que coincidir con los arrays (o con el mp4, si la entrada es archivo).
+
+`frames_origin` alinea cada array con el índice original (`t = origen / fps`). Si se omite, se usa `0…N-1`. El `anotado.mp4` usa un `output_fps` que conserva la duración del tramo de origen: `(N-1) * fps / (origen[-1] - origen[0])`. Ejemplo: orígenes `0, 5, 10` y `--fps 15` → `output_fps` 3.
+
+`procesar_lote(..., frames=..., frames_origin=..., fps=..., width=..., height=...)` acepta los mismos kwargs (un solo clip).
+
+Consola, `summary.txt` y `tracking.json["sampling"]` declaran una de estas:
 
 - `--fps was not set. Processing ran frame by frame.`
 - `--fps N was set. The video is … (rate R): each second uses frames …`
 - `--fps N was set, equal to or greater than the video rate (R fps). Processing ran frame by frame.`
-
-`--max-frames` limita frames de **origen** leídos, y después se aplica el muestreo.
+- `--frames was set (N arrays). Timeline fps is F. No mp4 sampling was applied.`
 
 ---
 
@@ -468,11 +522,14 @@ Por clip y tecnología, en `salidas/<tecnologia>/<stem>/`:
 
 Cabecera: `video`, `model`, `width`, `height`, `frames`, `source_frames`, `fps`, `output_fps`, `sampling`, `pose_backend`, `hands_visible`, `final_state`, `parameters`, `identifiers_yaml`.
 
-`sampling`:
+Con mp4, `fps` es el del archivo (float) y `parameters.fps` es el `--fps` de muestreo (o `null`). Con arrays, `fps` y `parameters.fps` son el entero de la línea temporal; `parameters.input` es `"frames"`; `parameters.frames_origin` es la `list[int]`; `parameters.width` / `parameters.height` son enteros. `width` y `height` de la cabecera también son enteros.
+
+`sampling` (mp4):
 
 ```json
 {
   "specified": true,
+  "input": "video",
   "fps_parameter": 2,
   "video_fps": 15.0,
   "integer_rate": 15,
@@ -482,6 +539,8 @@ Cabecera: `video`, `model`, `width`, `height`, `frames`, `source_frames`, `fps`,
   "description": "--fps 2 was set. …"
 }
 ```
+
+`sampling` (arrays): `"input": "frames"`, `fps_parameter` entero, `source_indices` igual a `frames_origin`, y `description` en inglés (`--frames was set … Timeline fps is …`).
 
 `containers[]`: `id`, `category`, `prompt`, scores, `first_frame` / `last_frame` (origen), `frames_seen`, `destination`, `accessory`, `body`, `side` (`left`/`right` en bolsillos; si no, `null`), `last_roi`, `rois` frame→`[x1,y1,x2,y2]`.
 
@@ -591,6 +650,7 @@ contextos, pistas = detectar_objetos(frames, escena, detector, sam, args)
 - **Cutie `No está el código`.** Falta el clone en `third_party/Cutie`.
 - **YOLOE silencioso.** Falta `pesos/yoloe-26m-seg.pt`; carrito/cesto/bolsa no saldrán, bolso/mochila/celular sí si están en COCO.
 - **`--fps` y clips que no van a 15 fps.** Los ejemplos 1/8 y 1/6/11 son para rate 15. Un clip a 12.333 fps redondea a 12; `--fps 2` toma offsets 0 y 6 (frames 1 y 7).
-- **Duración del anotado.** Con `--fps N` el writer usa N fps. Sin `--fps`, usa el fps del archivo.
+- **Duración del anotado.** Con mp4 y `--fps N` el writer usa N fps. Sin `--fps`, usa el fps del archivo. Con arrays, usa el `output_fps` derivado de `frames_origin` y el fps entero de la línea temporal.
+- **`--frames` no es un flag de shell.** Hay que asignar `args.frames` o el kwarg `frames=` con `list[np.ndarray]`. `--fps`, `--width` y `--height` sí van por CLI, y tienen que ser enteros.
 
 100DOH y detectores mano-objeto de esa generación no entran: piden CUDA/PyTorch anteriores a los de esta máquina.
