@@ -220,7 +220,7 @@ def volcar_comparativa(destino: Path, filas: list[dict]) -> Path:
         for campo in columnas:
             valor = item.get(campo, "")
             if campo == "ok":
-                valor = "si" if str(valor) in ("True", "true", "si") else "NO"
+                valor = "yes" if str(valor) in ("True", "true", "si", "yes") else "NO"
             celdas.append(str(valor) if valor not in (None, "") else "-")
         lineas.append("| " + " | ".join(celdas) + " |")
     (destino / "comparativa.md").write_text("\n".join(lineas) + "\n", encoding="utf-8")

@@ -28,9 +28,10 @@ from pipeline_manos import (
     anadir_argumentos_comunes,
     cargar_detectores,
     comprobar_entorno,
-    procesar_video,
+    procesar_lote,          # varios clips; un fallo no aborta el resto
+    procesar_video,         # un clip
     resolver_videos,
-    seguir_por_deteccion,  # redetectar cada frame; o pasar un `seguir` propio
+    seguir_por_deteccion,   # redetectar cada frame; o pasar un `seguir` propio
 )
 ```
 
@@ -38,14 +39,14 @@ from pipeline_manos import (
 
 ## Qué hace el sistema
 
-1. Localiza muñecas con **YOLO26n-pose**.
+1. Localiza muñecas con **YOLO26n-pose** o, con `--mediapipe`, MediaPipe Holistic sobre el recorte de persona.
 2. Recorta una ventana alrededor de cada palma (`--padding-muneca`, `--crop-min`).
 3. Dentro de ese recorte busca el objeto (YOLO26n-seg + MobileSAM opcional).
-4. Puntúa agarre contra las dos manos (`izquierda` / `derecha` / `ambas`).
-5. Detecta identificadores de escena en el **frame completo** según `identifiers.yaml` (YOLO cerrado + YOLOE open-vocab).
+4. Puntúa agarre contra las dos manos (`izquierda` / `derecha` / `ambas`). Dos recortes de la misma pieza se fusionan en un solo objeto.
+5. Detecta identificadores de escena en el **frame completo** según `identifiers.yaml` (YOLO cerrado + YOLOE open-vocab). El bolsillo no sale de YOLO: se sintetiza con las caderas de la pose (`body: true`).
 6. El backend **sigue o redetecta** la máscara del objeto. Si las muñecas no superan `hands.min_confidence`, ese frame no ejecuta el modelo de objeto.
-7. El último frame visible decide si el objeto acaba dentro de un contenedor (`ends_in_container`, `final_container`).
-8. Escribe vídeo anotado, `tracking.json`, `summary.txt`, `metrics.json` y una fila en la comparativa. Si nunca hay muñecas, `final_state` es `no_hands`.
+7. El último frame visible decide el depósito (`ends_in_container`, `final_container`): primero mueble (cesto/carrito/bolsa útil); el bolsillo solo con gesto de meter la mano; bolso/mochila no se usan como destino de reserva. Si la persona sale de escena o se pone de espaldas, no se infiere bolsillo (`final_state` queda `in_hand` o `released`).
+8. Escribe vídeo anotado, `tracking.json`, `summary.txt`, `metrics.json` y una fila en la comparativa. Si nunca hay muñecas, `final_state` es `no_hands`. Un clip que falle no aborta el lote (`procesar_lote`).
 
 Cutie y Track-Anything **propagan** la semilla. YOLO26-seg, SAM 3 y HOIST **redetectan** cada frame (`seguir_por_deteccion`). VISOR no usa este pipeline: corre su propio HOS + Faster R-CNN.
 
@@ -57,7 +58,7 @@ Cutie y Track-Anything **propagan** la semilla. YOLO26-seg, SAM 3 y HOIST **rede
 ROI_Segmentation-/
 ├── pipeline_manos.py              # Hub: detección, YAML, muestreo --fps, JSON, vídeo
 ├── salida_comun.py                # Carpetas, Medidor RAM/VRAM, comparativa.csv/.md/.json
-├── identifiers.yaml               # Catálogo de escena + hands.min_confidence (inglés)
+├── identifiers.yaml               # Catálogo de escena + hands.min_confidence (claves YAML en inglés)
 ├── identificadores.yaml           # Copia de compatibilidad para --identificadores antiguo
 ├── detector_palma/                # Pose, recorte, YOLO-seg, MobileSAM, score de agarre
 │   ├── personas.py                # AnalizadorEscena (YOLO-pose), dibujar_pose cintura↑
@@ -80,6 +81,7 @@ ROI_Segmentation-/
 ├── scripts.txt                    # Recetas de lanzamiento usadas en el laboratorio
 ├── pesos/                         # Checkpoints YOLO / YOLOE / MobileSAM (no en git)
 ├── videos/                        # Clips de entrada (no en git)
+├── fp_agosto2026/                 # Clips locales de depuración (no en git; ver .gitignore)
 ├── salidas/                       # Resultados (no en git)
 └── third_party/                   # Clones y operadores CUDA (no en git)
 ```
@@ -102,9 +104,12 @@ cargar_detectores(args)
         |
         v
 detectar_objetos()  → contextos por frame + pistas (máscaras semilla)
-seguir(frames, pistas, contextos, args)  → list[Objeto]   # lo único que cambia el backend
-seguir_contenedores()
-descartar_accesorios / quedarse_con_agarrados / descartar_contenedores_en_mano
+seguir(...) o seguir_por_deteccion()  → list[Objeto]   # lo único que cambia el backend
+seguir_contenedores()                 # YOLO/YOLOE + bolsillo de pose; cose/ancla accesorios
+recortar saltos a bolsa o cadera / sembrar celular junto a la palma
+completar_deposito()                  # sigue el objeto si la mano entra en un cesto
+descartar_accesorios / fusionar_objetos / quedarse_con_agarrados
+descartar_falsos_bolsillo             # si hay cesto, no se deja un fantasma en el bolsillo
         |
         v
 escribir_salidas() → anotado.mp4, frames/, tracking.json, summary.txt, metrics.json
@@ -117,13 +122,16 @@ Funciones clave de `pipeline_manos.py` para un integrador:
 |---|---|
 | `anadir_argumentos_comunes(parser)` | CLI compartida (`--videos`, `--video`, `--fps`, YAML, umbrales…). |
 | `resolver_videos(args)` | Un archivo (`--video`) o todos los de `--videos`. |
-| `cargar_catalogo(ruta)` / `Identificador` | Lectura de `identificadores.yaml`. |
-| `cargar_detectores(args)` | Devuelve `(escena, detector, sam, identificadores)`. |
+| `cargar_catalogo(ruta)` / `Identificador` | Lectura de `identifiers.yaml` (acepta claves en inglés o español). |
+| `cargar_detectores(args)` | Devuelve `(escena, detector, sam, identificadores)`. Con `--mediapipe` la escena usa Holistic. |
 | `leer_frames(video, max_frames, fps_proceso)` | `(frames, fps, indices_origen)`. |
 | `offsets_muestreo` / `describir_muestreo` / `frame_origen` | Muestreo `--fps` y remap a índices del vídeo original. |
 | `detectar_objetos(frames, escena, detector, sam, args)` | Pistas semilla. |
 | `seguir_por_deteccion(...)` | Backend nulo: la máscara de cada frame es la del detector. |
-| `procesar_video(detectores, video, args, tecnologia, backend, modelo, seguir, extra=None)` | Orquesta un clip. |
+| `fusionar_objetos(...)` | Une dos pistas de la misma pieza (p. ej. las dos manos sobre una botella). |
+| `contenedor_final(...)` | Destino del último frame: mueble primero, bolsillo solo con gesto. |
+| `procesar_video(...)` | Orquesta un clip. Captura fallos del seguidor y sigue con las pistas. |
+| `procesar_lote(...)` | Varios clips; un fallo no aborta el resto. Devuelve cuántos fallaron. |
 | `escribir_salidas(...)` | JSON + vídeo + comparativa. |
 | `Objeto`, `Vista` | Tipos de la traza. |
 
@@ -140,7 +148,7 @@ def seguir(frames: list[np.ndarray], pistas: list[dict], contextos, args) -> lis
     ...
 ```
 
-Cada pista tiene `id`, `primer_frame`, `ultimo_frame`, `mascaras: dict[int, np.ndarray]`, `agarres`. Tras propagar, llamar a `trazar(objeto, contextos, pista, args)` para rellenar `objeto.vistas`. Cutie fusiona identidades con `fusionar_objetos`.
+Cada pista tiene `id`, `primer_frame`, `ultimo_frame`, `mascaras: dict[int, np.ndarray]`, `agarres`. Tras propagar, llamar a `trazar(objeto, contextos, pista, args)` para rellenar `objeto.vistas`. Cutie y el pipeline común fusionan identidades con `fusionar_objetos`.
 
 ---
 
@@ -247,12 +255,13 @@ Salida: `salidas/track_anything/<clip>/`. Fila: `Track-Anything`.
 
 ### SAM 3 — `sam3_mano_objeto.py`
 
-Usa el pipeline común (`seguir_por_deteccion`). Umbrales de agarre un poco más estrictos por defecto (`min_detecciones=3`, `contacto_min=0.12`, `area_max_persona=0.02`, …) para no pegar bolsos de hombro u objetos de balda al objeto de la palma.
+Usa el pipeline común (`seguir_por_deteccion`). Umbrales de agarre un poco más estrictos por defecto (`min_detecciones=3`, `contacto_min=0.12`, `area_max_persona=0.02`, …) para no pegar bolsos de hombro u objetos de balda al objeto de la palma. En laboratorio se suele lanzar con `--mediapipe --fps 3`.
 
 ```bash
 source .venv/bin/activate
 hf auth login   # solo si se va a descargar facebook/sam3.1
 python sam3_mano_objeto.py --videos videos --salida salidas
+python sam3_mano_objeto.py --video videos/6_clip_2.mp4 --mediapipe --fps 3 --salida salidas
 ```
 
 Extra CLI: `--version {sam3.1,sam3}`, `--lote`. Salida: `salidas/sam3/<clip>/`. Fila: `SAM 3`.
@@ -285,7 +294,7 @@ Salida: `salidas/hoist/<clip>/`. Fila: `HOIST-Former`.
 
 ### VISOR-HOS — `visor_mano_objeto.py`
 
-Pipeline **propio**: Faster R-CNN (persona) + PointRend HOS (mano, contacto, lado, objeto). Entrenado en EPIC-KITCHENS egocéntrico; en tercera persona suele no pasar el umbral 0.5. Comparte `--fps`, `--video` y el layout de salida, no `identificadores.yaml`.
+Pipeline **propio**: Faster R-CNN (persona) + PointRend HOS (mano, contacto, lado, objeto). Entrenado en EPIC-KITCHENS egocéntrico; en tercera persona suele no pasar el umbral 0.5. Comparte `--fps`, `--video` y el layout de salida, no `identifiers.yaml`.
 
 ```bash
 source .venv/bin/activate
@@ -312,14 +321,13 @@ Todos salvo VISOR llaman a `anadir_argumentos_comunes`. VISOR replica `--videos`
 | `--video` | ninguno | Un solo archivo; ignora `--videos`. |
 | `--salida` | `salidas` | Raíz de resultados. |
 | `--identificadores` | `identifiers.yaml` | Catálogo de escena + `hands.min_confidence`. |
-| `--mediapipe` | off | Esqueleto MediaPipe (Pose + Hands) en lugar de YOLO-pose. |
+| `--mediapipe` | off | MediaPipe Holistic (pose + manos) en el recorte de persona, en lugar de YOLO-pose. Rechaza mejor la mano vacía. El umbral de muñecas es `hands.min_confidence` (0.20). |
 | `--fps N` | omitido = frame a frame | Ver [Muestreo `--fps`](#muestreo---fps). |
 | `--max-frames` | ninguno | Corta la lectura del vídeo de origen (antes del muestreo). |
 | `--sin-sam` | off | No usa MobileSAM. |
 | `--sin-contenedores` | off | Ignora el YAML. |
 | `--sin-frames` | off | No vuelca JPEG sueltos. |
-| `--sin-pose` | off | No pinta el esqueleto (cintura, brazos, muñecas, palmas; sin piernas ni abanico de dedos ni textos). |
-| `--mediapipe` | off | MediaPipe Pose + Hands instead of YOLO-pose. More reliable empty-hand rejection. Wrist visibility uses `hands.min_confidence` (default 0.20). |
+| `--sin-pose` | off | No pinta el esqueleto (cintura, brazos, muñecas, palmas; sin piernas ni textos). |
 
 ### Detección de palma
 
@@ -346,9 +354,9 @@ Todos salvo VISOR llaman a `anadir_argumentos_comunes`. VISOR replica `--videos`
 | `--modelo-contenedores` | `pesos/yoloe-26m-seg.pt` | |
 | `--conf-contenedor` / `--imgsz-contenedor` | 0.2 / 960 | |
 | `--cada-contenedor` | 5 | Inferir 1 de cada N frames procesados. |
-| `--dentro-min` | 0.6 | Fracción del objeto dentro del ROI destino. |
+| `--dentro-min` | 0.6 | Fracción del objeto dentro del ROI destino (mueble). |
 | `--factor-contenedor` | 2.5 | Tamaño relativo objeto vs contenedor. |
-| `--frames-fin` | 5 | Últimos frames visibles para `contenedor_final`. |
+| `--frames-fin` | 5 | Últimos frames visibles para decidir un mueble. El bolsillo no usa este margen: exige gesto. |
 
 Prueba corta recomendada:
 
@@ -386,9 +394,9 @@ Consola, `summary.txt` y `tracking.json["sampling"]` declaran siempre una de est
 
 ---
 
-## Scene identifiers (`identifiers.yaml`)
+## Identificadores de escena (`identifiers.yaml`)
 
-Immediate detection on the **full frame**. Keys and comments are in English. Category ids (`carrito`, `cesto`, …) stay stable so `cesto_2` does not change.
+Detección inmediata en el **frame completo**. Los campos del YAML van en inglés (`active`, `destination`, `accessory`, `body`). Las claves de categoría (`carrito`, `cesto`, `bolsillo`, …) se mantienen estables para que un `cesto_2` no cambie de nombre entre versiones.
 
 ```yaml
 hands:
@@ -406,20 +414,41 @@ identifiers:
       - mobile phone
 ```
 
-| Field | Effect |
+| Campo | Efecto |
 |---|---|
-| `active` | `false` disables the class. |
-| `ultralytics_id` | COCO shortcut. The detector resolves by `name`. |
-| `name` | Ultralytics English name. |
-| `prompts` | YOLOE text. Required if the class is not in COCO. |
-| `destination` | The handheld object may end inside this ROI (green). |
-| `accessory` | Shoulder bag / backpack: not merged with the grasped object. |
-| `body` | ROI from the pose (hip/thigh pocket). Not detected with YOLO. |
-| `hands.min_confidence` | Below this, wrists/hands are treated as not visible and the object model is skipped. |
+| `active` | `false` desactiva la clase. |
+| `ultralytics_id` | Atajo COCO. El detector resuelve por `name`. |
+| `name` | Nombre inglés de Ultralytics. |
+| `prompts` | Texto YOLOE. Obligatorio si la clase no está en COCO. |
+| `destination` | El objeto en la mano **puede** acabar dentro de este ROI (verde). |
+| `accessory` | Bolso/mochila: se sigue sobre la persona, no se fusiona con el objeto agarrado y **no** es destino de reserva. |
+| `body` | ROI a partir de la pose (bolsillo en cadera/muslo). No se detecta con YOLO. |
+| `hands.min_confidence` | Por debajo, esa muñeca no se busca. Si no hay ninguna, `final_state` es `no_hands`. |
 
 Ids Ultralytics COCO (contiguos 0–79), no los ids “paper” de COCO: `24` backpack, `26` handbag, `66` **keyboard**, `67` **cell phone**. El móvil es **67**. Carrito, cesto y bolsa no están en COCO: solo YOLOE.
 
-Por defecto en este repo: carrito, cesto, bolso, mochila, bolsa, celular y bolsillo activos. Destinos en verde; el resto (p. ej. celular) en cian. El bolsillo se estima con las caderas de la pose.
+Por defecto en este repo: carrito, cesto, bolso, mochila, bolsa, celular y bolsillo activos. Destinos en verde; el resto (p. ej. celular) en cian. El bolsillo se estima con las caderas de la pose (COCO 11/12). MediaPipe también descarta máscaras que son la mano vacía (los landmarks cubren la máscara).
+
+Filtros extra (no son flags): se tiran móviles débiles o que no están junto a una palma; cestos/bolsas en el borde de la imagen con score bajo (p. ej. packs de latas); accesorios de 1 muestra lejos de la persona (ROI congelado en el pasillo). El bolso/mochila se **ancla** a la persona cuando sí está sobre ella, para que el ROI no se quede quieto.
+
+---
+
+## Depósito: mueble vs bolsillo
+
+`contenedor_final` mira el último frame visible del objeto, en este orden:
+
+1. **Mueble** (`cesto`, `carrito`, bolsa que no es la que ya se lleva en la cadera). Basta solape o que la mano entre después en ese ROI.
+2. **Bolsillo** solo si, a la vez:
+   - el torso está erguido (no es agacharse al cesto);
+   - hay un gesto de meter la mano: la palma baja respecto a la cadera e entra en el ROI del mismo lado;
+   - esa mano no está ocupada por un objeto que no cabe en el bolsillo (bolsa de compra);
+   - la persona no sale de escena ni está de espaldas (sin cara visible no se afirma el depósito);
+   - el objeto no acaba de estar lejos del cuerpo (estantería).
+3. **Bolso / mochila** (`accessory: true`): se detectan y se pintan si van sobre la persona, pero no se usan como destino si el objeto no llega de verdad. Una mochila al fondo del pasillo no “traga” lo que se deja en la estantería.
+
+Si el último frame del objeto sigue en la mano y la persona se va o se da la vuelta, `final_state` es `in_hand`, no `inside_container`. Si lo suelta (estantería), es `released`.
+
+En el vídeo anotado el ROI del bolsillo **solo se pinta** cuando el gesto está activo. No se pinta el bolsillo del lado cuya mano sostiene un objeto, ni si el ROI del bolsillo solapa ese objeto.
 
 ---
 
@@ -429,15 +458,15 @@ Por clip y tecnología, en `salidas/<tecnologia>/<stem>/`:
 
 | Archivo | Contenido |
 |---|---|
-| `anotado.mp4` | Máscaras de objeto, caja + etiqueta de mano (`IZQ`/`DER`/`AMBAS`), ROI de identificadores, esqueleto cintura↑, HUD `frame <origen> t=…`. |
+| `anotado.mp4` | Máscaras de objeto, caja + etiqueta de mano (`L`/`R`/`BOTH`/`FREE`), ROI de identificadores, esqueleto cintura↑, HUD `frame <origen> t=…`. |
 | `frames/frame_XXXXX.jpg` | Mismo overlay; `XXXXX` es el índice original. `--sin-frames` lo omite. |
-| `tracking.json` | Full trace (schema below). |
-| `summary.txt` | Same events in English, plus the `--fps` sentence. |
-| `metrics.json` | `processed_frames`, `mean_fps`, `ms_per_frame`, RAM/VRAM peaks, CPU, `stages`. |
+| `tracking.json` | Traza completa (esquema abajo). Campos en inglés. |
+| `summary.txt` | Los mismos eventos en inglés, más la frase de `--fps`. |
+| `metrics.json` | `processed_frames`, `mean_fps`, `ms_per_frame`, picos RAM/VRAM, CPU, `stages`. |
 
-### `tracking.json` (shared pipeline)
+### `tracking.json` (pipeline común)
 
-Header: `video`, `model`, `width`, `height`, `frames`, `source_frames`, `fps`, `output_fps`, `sampling`, `pose_backend`, `hands_visible`, `final_state`, `parameters`, `identifiers_yaml`.
+Cabecera: `video`, `model`, `width`, `height`, `frames`, `source_frames`, `fps`, `output_fps`, `sampling`, `pose_backend`, `hands_visible`, `final_state`, `parameters`, `identifiers_yaml`.
 
 `sampling`:
 
@@ -454,7 +483,7 @@ Header: `video`, `model`, `width`, `height`, `frames`, `source_frames`, `fps`, `
 }
 ```
 
-`containers[]`: `id`, `category`, `prompt`, scores, `first_frame` / `last_frame` (source), `frames_seen`, `destination`, `accessory`, `last_roi`, `rois` frame→`[x1,y1,x2,y2]`.
+`containers[]`: `id`, `category`, `prompt`, scores, `first_frame` / `last_frame` (origen), `frames_seen`, `destination`, `accessory`, `body`, `side` (`left`/`right` en bolsillos; si no, `null`), `last_roi`, `rois` frame→`[x1,y1,x2,y2]`.
 
 `objects[]`:
 
@@ -464,9 +493,11 @@ Header: `video`, `model`, `width`, `height`, `frames`, `source_frames`, `fps`, `
 - `last_roi`, `last_center`, `last_visible_frame`
 - `final_state`: `in_hand` \| `released` \| `disappeared` \| `inside_container` \| `no_data` \| `no_hands`
 - `ends_in_container` (bool)
-- `final_container`: `{id, category, roi, fraction_inside, center_inside}` or `null`
+- `final_container`: `{id, category, roi, fraction_inside, center_inside}` o `null`
 - `events[]`: `appears`, `disappears`, `reappears`, `releases`, `regrasps`, `hand_change` (`from`/`to`)
 - `timeline[]`: `frame`, `processed_frame`, `t`, `hand`, `roi`, `center`, `area`, `grip_score`, `hand_scores`, `origin` (`detection` \| `propagation`)
+
+`hand` en JSON es `left` / `right` / `both` / `no_hand`. En el overlay se abrevia `L` / `R` / `BOTH` / `FREE`. Izquierda y derecha son las **de la persona**.
 
 VISOR escribe un JSON distinto (`eventos`, `linea_temporal` estilo SAM 3 original) más el bloque `muestreo`.
 
@@ -474,7 +505,7 @@ VISOR escribe un JSON distinto (`eventos`, `linea_temporal` estilo SAM 3 origina
 
 `salidas/comparativa/comparativa.csv` (también `.md` y `.json`). Una fila por `(clip, backend)`. Columnas: `clip`, `backend`, `ok`, `frames`, `fps`, `ms_frame`, `ms_segmentacion`, `ram_pico_mb`, `vram_pico_mb`, `cpu_pct`, `objetos`, `desapariciones`, `frames_con_objeto`, `codigo_salida`, `error`, `carpeta`.
 
-Cada pasada sustituye su fila y **no borra** las demás. Columnas añadidas a mano en el CSV se heredan.
+Cada pasada sustituye su fila y **no borra** las demás. Columnas añadidas a mano en el CSV se heredan. En `comparativa.md`, `ok` se escribe `yes` / `NO`.
 
 Backends escritos hoy: `YOLO26-seg`, `Cutie`, `Track-Anything`, `HOIST-Former`, `SAM 3`, `VISOR`.
 
@@ -497,12 +528,14 @@ procesar_video(
     backend="MiBackend",       # columna comparativa
     modelo="MiBackend …",      # campo JSON / resumen
     seguir=seguir,
-    extra={"propagator": "…"}, # merged into tracking.json
+    extra={"propagator": "…"}, # se fusiona en tracking.json
 )
 ```
 
-6. Do not change the `objects[]` / `containers[]` schema if a consumer already parses `tracking.json`.
+6. No cambiar el esquema de `objects[]` / `containers[]` si un consumidor ya parsea `tracking.json` (`side` y `body` en contenedores son aditivos).
 7. Documentar pesos y `third_party/` en este README.
+
+Para varios clips, `procesar_lote(detectores, videos, args, tecnologia, backend, modelo, seguir)` llama a `procesar_video` y no aborta el resto si uno falla.
 
 Para un servicio que solo quiera ROI final + contenedor, leer `tracking.json` → `objects[i].last_roi`, `ends_in_container`, `final_container`. No hace falta el vídeo anotado (`--sin-frames`).
 
@@ -522,12 +555,13 @@ contextos, pistas = detectar_objetos(frames, escena, detector, sam, args)
 
 ## Recetas de laboratorio
 
-`scripts.txt` guarda comandos reales. Patrón habitual: `--videos videos --identificadores identificadores.yaml --salida salidas`. Para un clip:
+`scripts.txt` guarda comandos reales. Patrón habitual: `--videos videos --identificadores identifiers.yaml --salida salidas`. Para un clip:
 
 ```bash
 .venv/bin/python sam3_mano_objeto.py \
   --video videos/3_clip_2.mp4 \
-  --identificadores identificadores.yaml \
+  --identificadores identifiers.yaml \
+  --mediapipe --fps 3 \
   --salida salidas
 ```
 
@@ -537,16 +571,22 @@ contextos, pistas = detectar_objetos(frames, escena, detector, sam, args)
 
 - `videos/clip.mp4`: objeto en la mano izquierda y traspaso a la derecha.
 - `videos/clip_2.mp4`: misma tarea, segundo clip.
-- En el laboratorio hay series `N_clip_M.mp4` (p. ej. `3_clip_3.mp4`) usadas en la comparativa de 43 clips.
+- En el laboratorio hay series `N_clip_M.mp4` (p. ej. `3_clip_3.mp4`, `6_clip_2.mp4`) usadas en la comparativa de 43 clips.
+- `fp_agosto2026/fp_*.mp4`: clips de depuración (depósito en cesto vs bolsillo, salida de escena, accesorios lejanos).
 
 ---
 
 ## Problemas frecuentes
 
 - **`python` no es el venv.** Pose26 / YOLO26 fallan. Usar `.venv/bin/python` o `source .venv/bin/activate`.
-- **Celular id 66.** En Ultralytics 66 es `keyboard`. Usar `nombre: cell phone` (id 67). El código resuelve por nombre.
+- **Celular id 66.** En Ultralytics 66 es `keyboard`. Usar `name: cell phone` (id 67). El código resuelve por nombre.
+- **Móvil fantasma.** Un `celular` débil pegado al objeto de la estantería se descarta. Hace falta score alto y palma cerca.
 - **Ruido en SAM 3 / recorte grande.** El recorte de muñeca es amplio (`padding-muneca` 1.2); la aceptación es `factor-palma` 0.85 sobre el radio del brazo. No ampliar el factor sin refiltrar agarre.
-- **Objeto fusionado con bolso de hombro.** `accesorio: true` en el YAML y `descartar_accesorios` en el pipeline.
+- **Objeto fusionado con bolso de hombro.** `accessory: true` en el YAML y `descartar_accesorios` en el pipeline. El ROI del bolso se ancla a la persona; una detección lejana de 1 frame se tira.
+- **Mochila lejana como destino.** Ya no. `accessory: true` no es depósito de reserva: dejar un artículo en la estantería no lo mete en una mochila al fondo del pasillo.
+- **Bolsillo vs cesto.** Agacharse al cesto no cuenta como meter la mano en el bolsillo. Gana el mueble. El ROI del bolsillo no se pinta si esa mano sostiene el objeto.
+- **Persona que sale o se da la vuelta.** No se infiere `inside_container` en el bolsillo: `in_hand` o `released`.
+- **Packs de latas como cesto/bolsa.** YOLOE en el borde inferior se filtra por score, tamaño y posición.
 - **HOIST no compila.** Hace falta el truco `third_party/nvcc-wrap` o el fallback PyTorch de atención deformable.
 - **Cutie `No está el código`.** Falta el clone en `third_party/Cutie`.
 - **YOLOE silencioso.** Falta `pesos/yoloe-26m-seg.pt`; carrito/cesto/bolsa no saldrán, bolso/mochila/celular sí si están en COCO.

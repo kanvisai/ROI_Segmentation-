@@ -51,6 +51,7 @@ YAML_IDENTIFICADORES = (
 )
 
 MANO_EN = {"izquierda": "left", "derecha": "right", "ambas": "both", "sin_mano": "no_hand"}
+MANO_HUD = {"izquierda": "L", "derecha": "R", "ambas": "BOTH", "sin_mano": "FREE"}
 ESTADO_EN = {
     "en_mano": "in_hand",
     "suelto": "released",
@@ -2780,7 +2781,7 @@ def _final_state_video(informes: list[dict]) -> str:
 
 
 def _etiqueta_mano(mano: str | None) -> str:
-    return {"izquierda": "IZQ", "derecha": "DER", "ambas": "AMBAS"}.get(mano or "", "SUELTO")
+    return MANO_HUD.get(mano or "sin_mano", "FREE")
 
 
 def _overlay_objeto(objeto: Objeto, indice: int, contenedores, contextos=None) -> tuple:
@@ -3353,6 +3354,7 @@ def escribir_salidas(
                 "destination": bool(p.get("destino", False)),
                 "accessory": bool(p.get("accesorio", False)),
                 "body": bool(p.get("cuerpo", False)),
+                "side": _mano_en(p.get("lado")),
                 "last_roi": list(p["caja"]) if p.get("caja") is not None else [],
                 "rois": {str(orig(f)): list(c) for f, c in sorted(p["cajas"].items())},
             }

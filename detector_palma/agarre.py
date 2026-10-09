@@ -183,17 +183,24 @@ def _puntuar_con_mano(instancia: Instancia, mano: Mano, encuadre: float) -> dict
 
 
 def etiquetar_lado(lado: str) -> str:
-    """Etiqueta corta para HUD: IZQ / DER / AMB / IZQ→DER."""
+    """Etiqueta corta para HUD: L / R / BOTH / L→R."""
     clave = (lado or "").lower()
     if "→" in clave or "->" in clave:
-        return clave.replace("izquierda", "IZQ").replace("derecha", "DER").replace("->", "→").upper()
-    if clave.startswith("izq"):
-        return "IZQ"
-    if clave.startswith("der"):
-        return "DER"
-    if clave.startswith("amb"):
-        return "AMB"
-    return lado.upper()[:3] if lado else ""
+        return (
+            clave.replace("izquierda", "L")
+            .replace("derecha", "R")
+            .replace("left", "L")
+            .replace("right", "R")
+            .replace("->", "→")
+            .upper()
+        )
+    if clave.startswith("izq") or clave.startswith("left"):
+        return "L"
+    if clave.startswith("der") or clave.startswith("right"):
+        return "R"
+    if clave.startswith("amb") or clave.startswith("both"):
+        return "BOTH"
+    return lado.upper()[:4] if lado else ""
 
 
 def _elegir_lado(puntuaciones: list[tuple[float, str, dict]], fraccion_area: float) -> str:

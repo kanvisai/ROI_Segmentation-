@@ -141,15 +141,15 @@ CADERA_IZQ, CADERA_DER = 11, 12
 
 # Esqueleto de la cintura hacia arriba (COCO-17). Las piernas (13-16) no se dibujan.
 POSE_NOMBRES = {
-    0: "nariz",
-    5: "hombro IZQ",
-    6: "hombro DER",
-    7: "codo IZQ",
-    8: "codo DER",
-    9: "muñeca IZQ",
-    10: "muñeca DER",
-    11: "cadera IZQ",
-    12: "cadera DER",
+    0: "nose",
+    5: "L shoulder",
+    6: "R shoulder",
+    7: "L elbow",
+    8: "R elbow",
+    9: "L wrist",
+    10: "R wrist",
+    11: "L hip",
+    12: "R hip",
 }
 POSE_HUESOS = (
     (5, 6),

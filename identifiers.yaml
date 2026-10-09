@@ -17,8 +17,14 @@
 # (e.g. cesto_2). Do not rename them if downstream code depends on those ids.
 #
 # destination: true  → the handheld object may end inside this ROI.
-# accessory: true    → shoulder bag / backpack: do not treat as the grasped object.
+# accessory: true    → shoulder bag / backpack: tracked on the person, never
+#                      treated as the grasped object, and not used as a fallback
+#                      deposit (the object must actually reach the bag).
 # body: true         → ROI from pose (e.g. trouser pocket at the hip), not YOLO.
+#                      A pocket counts as a deposit only with an upright torso
+#                      and a hand-into-pocket gesture. Furniture (cesto/carrito)
+#                      wins over the pocket. No pocket if the person leaves or
+#                      turns their back.
 #
 # hands.min_confidence: wrist/hand visibility threshold, applied per hand.
 # A hand below this value is not searched for objects. If no wrist is ever

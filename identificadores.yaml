@@ -1,5 +1,9 @@
 # Scene identifiers: detected on the full frame, without waiting for a hand.
 # Canonical file: identifiers.yaml. This copy keeps older --identificadores paths working.
+#
+# destination / accessory / body: same meaning as identifiers.yaml.
+# A pocket (body: true) is only a deposit with a hand-into-pocket gesture.
+# Bags (accessory: true) are not fallback deposits.
 
 # hands.min_confidence applies per hand. MediaPipe rejects empty-hand masks.
 hands:
