@@ -328,7 +328,7 @@ Todos salvo VISOR llaman a `anadir_argumentos_comunes`. VISOR replica `--videos`
 | `--salida` | `salidas` | Raíz de resultados. |
 | `--identificadores` | `identifiers.yaml` | Catálogo de escena + `hands.min_confidence`. |
 | `--mediapipe` | off | MediaPipe Holistic (pose + manos) en el recorte de persona, en lugar de YOLO-pose. Rechaza mejor la mano vacía. El umbral de muñecas es `hands.min_confidence` (0.20). |
-| `--fps N` | omitido = frame a frame (solo mp4) | Entero. Con mp4: muestreo. Con `--frames`: fps de la línea temporal (**obligatorio**). Ver [Muestreo `--fps`](#muestreo---fps). |
+| `--fps N\|half\|third` | omitido = frame a frame (solo mp4) | Entero, `half` o `third`. Con mp4: muestreo (`half`/`third` = la mitad o un tercio del fps del archivo). Con `--frames`: fps entero de la línea temporal (**obligatorio**). Ver [Muestreo `--fps`](#muestreo---fps). |
 | `--max-frames` | ninguno | Corta la lectura del vídeo de origen (antes del muestreo). No aplica a arrays en memoria. |
 | `--sin-sam` | off | No usa MobileSAM. |
 | `--sin-contenedores` | off | Ignora el YAML. |
@@ -376,12 +376,12 @@ Prueba corta recomendada:
 
 ## Muestreo `--fps`
 
-`--fps` es un **entero** ≥ 1. El significado depende de la entrada:
+`--fps` acepta un **entero** ≥ 1 o las palabras **`half`** / **`third`**. El significado depende de la entrada:
 
-| Entrada | `--fps N` | Si se omite |
+| Entrada | `--fps N` / `half` / `third` | Si se omite |
 |---|---|---|
-| mp4 | **N frames por cada segundo de vídeo**, no un stride uniforme | Frame a frame |
-| `list[np.ndarray]` | Fps de la **línea temporal** (obligatorio). No se vuelve a muestrear | Error |
+| mp4 | **N frames por cada segundo de vídeo**, no un stride uniforme. `half` = `round(fps)/2`, `third` = `round(fps)/3` (un vídeo a 12 fps: `half` ≡ 6, `third` ≡ 4) | Frame a frame |
+| `list[np.ndarray]` | Fps **entero** de la **línea temporal** (obligatorio). No se vuelve a muestrear | Error |
 
 ### mp4
 
@@ -392,10 +392,12 @@ Prueba corta recomendada:
 | `--fps 1` | 0 | 1 |
 | `--fps 2` | 0, 7 | 1 y 8 |
 | `--fps 3` | 0, 5, 10 | 1, 6 y 11 |
+| `--fps half` (rate 12) | ≡ `--fps 6` | 6 muestras/s |
+| `--fps third` (rate 12) | ≡ `--fps 4` | 4 muestras/s |
 
 Si `N >= rate`, el procesamiento es **frame a frame**.
 
-El seguimiento interno usa índices 0…M−1 de los frames **procesados**. JSON, HUD y nombres `frames/frame_XXXXX.jpg` se remapean al índice **original** del archivo (`t = orig / fps_video`). El `anotado.mp4` se escribe a `N` fps cuando hay muestreo, para conservar la duración.
+El seguimiento interno usa índices 0…M−1 de los frames **procesados**. JSON, HUD y nombres `frames/<video>_frame_XXXXX.jpg` se remapean al índice **original** del archivo (`t = orig / fps_video`). El `anotado.mp4` se escribe a `N` fps cuando hay muestreo, para conservar la duración.
 
 `--max-frames` limita frames de **origen** leídos, y después se aplica el muestreo.
 
@@ -513,7 +515,7 @@ Por clip y tecnología, en `salidas/<tecnologia>/<stem>/`:
 | Archivo | Contenido |
 |---|---|
 | `anotado.mp4` | Máscaras de objeto, caja + etiqueta de mano (`L`/`R`/`BOTH`/`FREE`), ROI de identificadores, esqueleto cintura↑, HUD `frame <origen> t=…`. |
-| `frames/frame_XXXXX.jpg` | Mismo overlay; `XXXXX` es el índice original. `--sin-frames` lo omite. |
+| `frames/<video>_frame_XXXXX.jpg` | Mismo overlay; `XXXXX` es el índice original. `--sin-frames` lo omite. |
 | `tracking.json` | Traza completa (esquema abajo). Campos en inglés. |
 | `summary.txt` | Los mismos eventos en inglés, más la frase de `--fps`. |
 | `metrics.json` | `processed_frames`, `mean_fps`, `ms_per_frame`, picos RAM/VRAM, CPU, `stages`. |

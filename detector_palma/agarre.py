@@ -37,8 +37,8 @@ MIN_CONTACTO_AGARRE = 0.10
 # Por encima de esta fraccion de frame se permite la etiqueta 'ambas'.
 FRACCION_AMBAS = 0.012
 # Un carrito/banco ronda el 1-3 % del frame y ~30 % de la persona; un tarro ~0.03 %.
-FRACCION_MAX_PERSONA = 0.12
-ALTURA_MAX_PERSONA = 0.42
+FRACCION_MAX_PERSONA = 0.10
+ALTURA_MAX_PERSONA = 0.40
 
 
 def _solape_disco(mascara: np.ndarray, cx: float, cy: float, radio: float) -> float:

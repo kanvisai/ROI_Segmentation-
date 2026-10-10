@@ -3,7 +3,8 @@
 #
 # destination / accessory / body: same meaning as identifiers.yaml.
 # A pocket (body: true) is only a deposit with a hand-into-pocket gesture.
-# Bags (accessory: true) are not fallback deposits.
+# Back-turned + pocket gesture still counts. A waist bag is a destination if
+# the object reaches it; a shoulder bag is not a fallback deposit.
 
 # hands.min_confidence applies per hand. MediaPipe rejects empty-hand masks.
 hands:
@@ -17,6 +18,9 @@ identifiers:
     prompts:
       - shopping cart
       - shopping trolley
+      - metal cart
+      - supermarket cart
+      - wire cart
 
   cesto:
     active: true

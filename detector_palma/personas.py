@@ -17,7 +17,7 @@ import numpy as np
 
 from pathlib import Path
 
-from .geometria import Caja, expandir_caja
+from .geometria import Caja, expandir_caja, iou_cajas
 from .utils import importar, importar_opcional
 
 import atexit
@@ -133,6 +133,102 @@ def _esqueleto_en_caja(kp: np.ndarray, caja: Caja, umbral: float = 0.15) -> bool
     margen = 0.15 * max(x2 - x1, y2 - y1, 1)
     return (x1 - margen) <= cx <= (x2 + margen) and (y1 - margen) <= cy <= (y2 + margen)
 
+
+def _esqueleto_colapsado(kp: np.ndarray, persona: Persona, umbral: float = 0.15) -> bool:
+    """Holistic a veces pinta el cuerpo entero sobre la cabeza: no sustituir YOLO-pose."""
+    if kp is None or len(kp) < 11:
+        return True
+    pts = [(float(p[0]), float(p[1])) for p in kp if float(p[2]) >= umbral]
+    if len(pts) < 4:
+        return True
+    xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+    span = max(max(xs) - min(xs), max(ys) - min(ys))
+    altura = max(float(persona.altura), 40.0)
+    if span < 0.42 * altura:
+        return True
+    nariz = kp[0]
+    if float(nariz[2]) < umbral:
+        return False
+    nx, ny = float(nariz[0]), float(nariz[1])
+    munecas_en_cabeza = 0
+    for wi in (9, 10):
+        if float(kp[wi][2]) < umbral:
+            continue
+        if abs(float(kp[wi][0]) - nx) < 0.40 * altura and abs(float(kp[wi][1]) - ny) < 0.28 * altura:
+            munecas_en_cabeza += 1
+    return munecas_en_cabeza >= 1 and span < 0.70 * altura
+
+
+def _esqueleto_desproporcionado(kp: np.ndarray, persona: Persona, prev=None, umbral: float = 0.15) -> bool:
+    """Un recorte Holistic inestable estira brazos o comprime el torso de un frame a otro."""
+    if kp is None or len(kp) < 13:
+        return True
+    ph = max(float(persona.altura), 40.0)
+    pw = max(1.0, float(persona.caja[2] - persona.caja[0]))
+
+    def _pt(idx: int):
+        if float(kp[idx][2]) < umbral:
+            return None
+        return (float(kp[idx][0]), float(kp[idx][1]))
+
+    hombros = [_pt(5), _pt(6)]
+    caderas = [_pt(11), _pt(12)]
+    if all(hombros) and all(caderas):
+        ancho_h = float(np.hypot(hombros[0][0] - hombros[1][0], hombros[0][1] - hombros[1][1]))
+        mid_h = ((hombros[0][0] + hombros[1][0]) * 0.5, (hombros[0][1] + hombros[1][1]) * 0.5)
+        mid_c = ((caderas[0][0] + caderas[1][0]) * 0.5, (caderas[0][1] + caderas[1][1]) * 0.5)
+        torso = float(np.hypot(mid_h[0] - mid_c[0], mid_h[1] - mid_c[1]))
+        if ancho_h > 1.35 * pw or (ancho_h > 8 and ancho_h < 0.12 * pw):
+            return True
+        if torso > 0.85 * ph or (torso > 8 and torso < 0.16 * ph):
+            return True
+    if prev is not None and len(prev) >= 11:
+        for idx in (9, 10, 5, 6):
+            if float(kp[idx][2]) < umbral or float(prev[idx][2]) < umbral:
+                continue
+            salto = float(np.hypot(float(kp[idx][0]) - float(prev[idx][0]), float(kp[idx][1]) - float(prev[idx][1])))
+            if salto > 0.42 * ph:
+                return True
+    return False
+
+
+def _mano_abierta_landmarks(puntos: np.ndarray) -> bool:
+    """True si al menos tres dedos están extendidos: palma abierta, no agarra."""
+    if puntos is None or len(puntos) < 21:
+        return False
+    muneca = puntos[0]
+    extendidos = 0
+    for mcp, tip in ((5, 8), (9, 12), (13, 16), (17, 20)):
+        d_tip = float(np.hypot(puntos[tip][0] - muneca[0], puntos[tip][1] - muneca[1]))
+        d_mcp = float(np.hypot(puntos[mcp][0] - muneca[0], puntos[mcp][1] - muneca[1]))
+        if d_mcp > 1.0 and d_tip > 1.35 * d_mcp:
+            extendidos += 1
+    return extendidos >= 4
+
+
+def _brazo_colgando_abierto(kp: np.ndarray, muneca: int, codo: int, cadera: int,
+                            altura: float, umbral: float = 0.15) -> bool:
+    """Brazo estirado hacia abajo y lejos de la cadera: palma abierta, no sujeta."""
+    if kp is None or max(muneca, codo, cadera) >= len(kp):
+        return False
+    if float(kp[muneca][2]) < umbral or float(kp[codo][2]) < umbral:
+        return False
+    wx, wy = float(kp[muneca][0]), float(kp[muneca][1])
+    ex, ey = float(kp[codo][0]), float(kp[codo][1])
+    vx, vy = wx - ex, wy - ey
+    norma = float(np.hypot(vx, vy))
+    if norma < 16.0 or (vy / norma) < 0.85:
+        return False
+    ph = max(float(altura), 40.0)
+    hx, hy = wx, wy
+    if float(kp[cadera][2]) >= umbral:
+        hx, hy = float(kp[cadera][0]), float(kp[cadera][1])
+    if float(np.hypot(wx - hx, wy - hy)) < 0.28 * ph:
+        return False
+    if wy < hy + 0.10 * ph:
+        return False
+    return True
+
 # Indices COCO-17 de las articulaciones que nos interesan.
 MUNECA_IZQ, MUNECA_DER = 9, 10
 CODO_IZQ, CODO_DER = 7, 8
@@ -206,6 +302,7 @@ class Mano:
     puntos_agarre: list[tuple[float, float]] = field(default_factory=list)
     conexiones: list[tuple[tuple[float, float], tuple[float, float]]] = field(default_factory=list)
     origen: str = "pose"
+    abierta: bool = False
 
     def __post_init__(self) -> None:
         if self.palma is None:
@@ -218,6 +315,7 @@ class Persona:
     caja_padded: Caja              # bounding box con el margen aplicado
     confianza: float = 1.0
     keypoints: np.ndarray | None = None
+    track_id: int = -1
 
     @property
     def altura(self) -> float:
@@ -333,6 +431,9 @@ class AnalizadorEscena:
         self._pose = None
         self._holistic = None
         self._atexit_mp = False
+        self._pose_prev: dict[int, dict] = {}
+        self._personas_prev: list[tuple[int, Caja]] = []
+        self._next_tid = 0
 
         if estrategia == "auto":
             estrategia = "pose"
@@ -383,9 +484,36 @@ class AnalizadorEscena:
         contexto = ContextoEscena(ancho=ancho, alto=alto, conf_dibujo=self.conf_mano)
         if self.estrategia == "pose":
             self._analizar_pose(frame, contexto)
+            self._rastrear_personas(contexto)
         elif self.estrategia == "mediapipe":
             self._analizar_mediapipe(frame, contexto)
         return contexto
+
+    def _rastrear_personas(self, contexto: ContextoEscena) -> None:
+        """Mantiene un id estable por persona (IoU) para no mezclar manos entre gente."""
+        usados: set[int] = set()
+        ids = [-1] * len(contexto.personas)
+        for i, persona in enumerate(contexto.personas):
+            mejor, mejor_iou = -1, 0.28
+            for tid, caja in self._personas_prev:
+                if tid in usados:
+                    continue
+                solape = iou_cajas(persona.caja, caja)
+                if solape > mejor_iou:
+                    mejor, mejor_iou = tid, solape
+            if mejor >= 0:
+                ids[i] = mejor
+                usados.add(mejor)
+            else:
+                ids[i] = self._next_tid
+                self._next_tid += 1
+            persona.track_id = ids[i]
+        for mano in contexto.manos:
+            if 0 <= mano.persona_id < len(ids):
+                mano.persona_id = ids[mano.persona_id]
+        self._personas_prev = [
+            (ids[i], contexto.personas[i].caja) for i in range(len(contexto.personas))
+        ]
 
     # -- Estrategia YOLO-pose -------------------------------------------------
 
@@ -436,7 +564,7 @@ class AnalizadorEscena:
                 contexto.manos.extend(
                     self._manos_desde_keypoints(
                         persona.keypoints, radio, len(contexto.personas) - 1,
-                        self.conf_mano, origen="pose",
+                        self.conf_mano, origen="pose", altura=persona.altura,
                     )
                 )
 
@@ -451,6 +579,7 @@ class AnalizadorEscena:
         muneca_der: int = MUNECA_DER,
         codo_izq: int = CODO_IZQ,
         codo_der: int = CODO_DER,
+        altura: float = 0.0,
     ) -> list[Mano]:
         """Estima palma y un abanico de puntos de agarre a partir de codo y muneca.
 
@@ -487,6 +616,10 @@ class AnalizadorEscena:
                         palma[1] + 0.55 * radio * dy + k * radio_palma * perp_y,
                     )
                 )
+            cadera = CADERA_IZQ if lado == "izquierda" else CADERA_DER
+            abierta = _brazo_colgando_abierto(
+                kp, muneca, codo, cadera, altura or (radio / 0.12), umbral
+            )
             manos.append(
                 Mano(
                     punto=muneca_xy,
@@ -499,6 +632,7 @@ class AnalizadorEscena:
                     direccion=(dx, dy),
                     puntos_agarre=puntos_agarre,
                     origen=origen,
+                    abierta=abierta,
                 )
             )
         return manos
@@ -512,9 +646,11 @@ class AnalizadorEscena:
         plano y el esqueleto queda desfasado respecto a la persona.
         """
         self._analizar_pose(frame, contexto)
+        self._rastrear_personas(contexto)
         if self._holistic is None or not contexto.personas:
             return
-        for pid, persona in enumerate(contexto.personas):
+        for persona in contexto.personas:
+            pid = persona.track_id if persona.track_id >= 0 else 0
             self._holistic_en_persona(frame, persona, contexto, pid)
 
     def _holistic_en_persona(
@@ -530,6 +666,34 @@ class AnalizadorEscena:
         x1, y1, x2, y2 = caja_h
         x1, y1 = max(0, int(x1)), max(0, int(y1))
         x2, y2 = min(contexto.ancho, int(x2)), min(contexto.alto, int(y2))
+        w, h = max(1, x2 - x1), max(1, y2 - y1)
+        prev = self._pose_prev.get(pid)
+        # Persona recortada por el borde inferior o caja tipo cabeza: hay que
+        # incluir brazos y el móvil que queda fuera del bbox de YOLO.
+        # Persona recortada, caja tipo cabeza, o agachada (mete algo en el cesto).
+        expandir = y2 >= contexto.alto - 12 or h < 1.55 * w or h < 0.22 * contexto.alto
+        if expandir and prev and prev.get("crop"):
+            px1, py1, px2, py2 = prev["crop"]
+            pw, ph = max(1, px2 - px1), max(1, py2 - py1)
+            # Si el bbox de YOLO se encoge de golpe, reutilizar el recorte anterior
+            # desplazado: evita un esqueleto desproporcionado en el frame siguiente.
+            if h < 0.72 * ph or w < 0.72 * pw:
+                dcx = 0.5 * ((x1 + x2) - (px1 + px2))
+                dcy = 0.5 * ((y1 + y2) - (py1 + py2))
+                x1 = max(0, int(px1 + dcx))
+                y1 = max(0, int(py1 + dcy))
+                x2 = min(contexto.ancho, int(px2 + dcx))
+                y2 = min(contexto.alto, int(py2 + dcy))
+                caja_h = (x1, y1, x2, y2)
+                expandir = False
+        if expandir:
+            extra_x = int(1.15 * w)
+            extra_y = int(1.8 * h)
+            x1 = max(0, x1 - extra_x)
+            x2 = min(contexto.ancho, x2 + extra_x)
+            y1 = max(0, y1 - extra_y // 3)
+            y2 = min(contexto.alto, y2 + extra_y)
+            caja_h = (x1, y1, x2, y2)
         if x2 - x1 < 40 or y2 - y1 < 40:
             return
         recorte = np.ascontiguousarray(cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2RGB))
@@ -544,24 +708,40 @@ class AnalizadorEscena:
         except Exception:
             return
         kp = self._keypoints_holistic(resultado, contexto, x1, y1, sx, sy, lado)
-        if kp is None or not _esqueleto_en_caja(kp, caja_h):
-            return
-        persona.keypoints = kp
+        pose_ok = bool(
+            kp is not None
+            and _esqueleto_en_caja(kp, caja_h)
+            and not _esqueleto_colapsado(kp, persona)
+            and not _esqueleto_desproporcionado(
+                kp, persona, prev.get("kp") if prev else None
+            )
+        )
+        if pose_ok:
+            persona.keypoints = kp
+            self._pose_prev[pid] = {"crop": caja_h, "kp": kp, "caja": persona.caja}
+        kp_ref = persona.keypoints if persona.keypoints is not None else kp
         munecas = {
-            "izquierda": float(kp[9][2]),
-            "derecha": float(kp[10][2]),
+            "izquierda": float(kp_ref[9][2]) if kp_ref is not None and len(kp_ref) > 9 else 0.0,
+            "derecha": float(kp_ref[10][2]) if kp_ref is not None and len(kp_ref) > 10 else 0.0,
         }
         radio = max(20.0, self.radio_mano * persona.altura)
-        contexto.manos = [m for m in contexto.manos if m.persona_id != pid]
-        pose_manos = self._manos_desde_keypoints(
-            kp, radio, pid, self.conf_mano, origen="mediapipe"
-        )
         mp_manos = self._manos_holistic_recorte(
             resultado, contexto, munecas, x1, y1, sx, sy, lado, pid
         )
-        por_lado = {m.lado: m for m in pose_manos}
-        por_lado.update({m.lado: m for m in mp_manos})
-        contexto.manos.extend(por_lado.values())
+        if pose_ok:
+            contexto.manos = [m for m in contexto.manos if m.persona_id != pid]
+            pose_manos = self._manos_desde_keypoints(
+                kp, radio, pid, self.conf_mano, origen="mediapipe", altura=persona.altura
+            )
+            por_lado = {m.lado: m for m in pose_manos}
+            por_lado.update({m.lado: m for m in mp_manos})
+            contexto.manos.extend(por_lado.values())
+        elif mp_manos:
+            # Pose Holistic inestable: se conserva YOLO-pose y solo se actualizan los dedos.
+            por_lado = {m.lado: m for m in contexto.manos if m.persona_id == pid}
+            por_lado.update({m.lado: m for m in mp_manos})
+            contexto.manos = [m for m in contexto.manos if m.persona_id != pid]
+            contexto.manos.extend(por_lado.values())
 
     def _keypoints_holistic(
         self, resultado, contexto: ContextoEscena, x1: int, y1: int,
@@ -647,6 +827,7 @@ class AnalizadorEscena:
             puntos_agarre=yemas,
             conexiones=conexiones,
             origen="mediapipe",
+            abierta=_mano_abierta_landmarks(puntos),
         )
 
     def cerrar(self) -> None:

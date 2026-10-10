@@ -20,11 +20,13 @@
 # accessory: true    → shoulder bag / backpack: tracked on the person, never
 #                      treated as the grasped object, and not used as a fallback
 #                      deposit (the object must actually reach the bag).
-# body: true         → ROI from pose (e.g. trouser pocket at the hip), not YOLO.
-#                      A pocket counts as a deposit only with an upright torso
-#                      and a hand-into-pocket gesture. Furniture (cesto/carrito)
-#                      wins over the pocket. No pocket if the person leaves or
-#                      turns their back.
+# body: true         → ROI from pose (e.g. trouser pocket). The box is small,
+#                      about hand-sized, from the waist down onto the thigh.
+#                      A pocket counts as a deposit only with an upright torso,
+#                      a real handheld object, and the hand on that hip. A hand
+#                      far from the waist cannot end in a pocket. Furniture
+#                      (cesto/carrito) wins if the object is near the basket.
+#                      A waist bag is a destination only if it stays on the body.
 #
 # hands.min_confidence: wrist/hand visibility threshold, applied per hand.
 # A hand below this value is not searched for objects. If no wrist is ever
@@ -42,6 +44,9 @@ identifiers:
     prompts:
       - shopping cart
       - shopping trolley
+      - metal cart
+      - supermarket cart
+      - wire cart
 
   cesto:
     active: true
