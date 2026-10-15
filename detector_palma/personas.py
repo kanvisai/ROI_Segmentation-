@@ -17,7 +17,7 @@ import numpy as np
 
 from pathlib import Path
 
-from .geometria import Caja, expandir_caja, iou_cajas
+from .geometria import Caja, expandir_caja
 from .utils import importar, importar_opcional
 
 import atexit
@@ -315,7 +315,6 @@ class Persona:
     caja_padded: Caja              # bounding box con el margen aplicado
     confianza: float = 1.0
     keypoints: np.ndarray | None = None
-    track_id: int = -1
 
     @property
     def altura(self) -> float:
@@ -432,8 +431,6 @@ class AnalizadorEscena:
         self._holistic = None
         self._atexit_mp = False
         self._pose_prev: dict[int, dict] = {}
-        self._personas_prev: list[tuple[int, Caja]] = []
-        self._next_tid = 0
 
         if estrategia == "auto":
             estrategia = "pose"
@@ -484,36 +481,9 @@ class AnalizadorEscena:
         contexto = ContextoEscena(ancho=ancho, alto=alto, conf_dibujo=self.conf_mano)
         if self.estrategia == "pose":
             self._analizar_pose(frame, contexto)
-            self._rastrear_personas(contexto)
         elif self.estrategia == "mediapipe":
             self._analizar_mediapipe(frame, contexto)
         return contexto
-
-    def _rastrear_personas(self, contexto: ContextoEscena) -> None:
-        """Mantiene un id estable por persona (IoU) para no mezclar manos entre gente."""
-        usados: set[int] = set()
-        ids = [-1] * len(contexto.personas)
-        for i, persona in enumerate(contexto.personas):
-            mejor, mejor_iou = -1, 0.28
-            for tid, caja in self._personas_prev:
-                if tid in usados:
-                    continue
-                solape = iou_cajas(persona.caja, caja)
-                if solape > mejor_iou:
-                    mejor, mejor_iou = tid, solape
-            if mejor >= 0:
-                ids[i] = mejor
-                usados.add(mejor)
-            else:
-                ids[i] = self._next_tid
-                self._next_tid += 1
-            persona.track_id = ids[i]
-        for mano in contexto.manos:
-            if 0 <= mano.persona_id < len(ids):
-                mano.persona_id = ids[mano.persona_id]
-        self._personas_prev = [
-            (ids[i], contexto.personas[i].caja) for i in range(len(contexto.personas))
-        ]
 
     # -- Estrategia YOLO-pose -------------------------------------------------
 
@@ -646,11 +616,9 @@ class AnalizadorEscena:
         plano y el esqueleto queda desfasado respecto a la persona.
         """
         self._analizar_pose(frame, contexto)
-        self._rastrear_personas(contexto)
         if self._holistic is None or not contexto.personas:
             return
-        for persona in contexto.personas:
-            pid = persona.track_id if persona.track_id >= 0 else 0
+        for pid, persona in enumerate(contexto.personas):
             self._holistic_en_persona(frame, persona, contexto, pid)
 
     def _holistic_en_persona(

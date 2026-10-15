@@ -193,7 +193,6 @@ class Vista:
     score: float = 0.0
     scores: dict = field(default_factory=dict)
     origen: str = "propagacion"
-    persona_id: int = -1
 
 
 @dataclass
@@ -611,12 +610,7 @@ def _mano_lejos_del_torso(mano, contexto) -> bool:
     """True si la palma no está pegada al cuerpo (brazo extendido, no un bulto al costado)."""
     if contexto is None or not getattr(contexto, "personas", None):
         return True
-    persona = None
-    tid = getattr(mano, "persona_id", -1)
-    if tid >= 0:
-        persona = next((p for p in contexto.personas if getattr(p, "track_id", -1) == tid), None)
-    if persona is None:
-        persona = max(contexto.personas, key=lambda p: p.altura)
+    persona = max(contexto.personas, key=lambda p: p.altura)
     palma = mano.palma or mano.punto
     pc = _centro_caja(persona.caja)
     return float(np.hypot(palma[0] - pc[0], palma[1] - pc[1])) > 0.30 * max(persona.altura, 40.0)
@@ -930,27 +924,11 @@ def _cajas_bolsillo(contexto, ident: Identificador) -> list[dict]:
         r = float(getattr(mano, "radio_palma", None) or mano.radio or 0.0)
         if r > 0:
             radio_mano = r if radio_mano is None else max(radio_mano, r)
-    candidatas = []
+    salida: list[dict] = []
     for persona in getattr(contexto, "personas", []) or []:
         altura = max(float(persona.altura), 1.0)
         if altura < 90:
             continue
-        tid = getattr(persona, "track_id", -1)
-        if not any(
-            m.persona_id == tid and m.lado in ("izquierda", "derecha")
-            for m in (getattr(contexto, "manos", None) or [])
-        ):
-            continue
-        px1, py1, px2, py2 = persona.caja
-        if altura < 0.32 * alto and py1 < 0.12 * alto:
-            continue
-        candidatas.append(persona)
-    if candidatas:
-        max_h = max(p.altura for p in candidatas)
-        candidatas = [p for p in candidatas if p.altura >= 0.55 * max_h]
-    salida: list[dict] = []
-    for persona in candidatas:
-        altura = max(float(persona.altura), 1.0)
         px1, py1, px2, py2 = persona.caja
         kp = persona.keypoints
         tiene_cadera = kp is not None and (
@@ -1149,23 +1127,26 @@ def _persona_sale_de_escena(contexto, margen: int = 10) -> bool:
 
 
 def _de_espaldas(contexto) -> bool:
-    """Sin cara visible: de espaldas, no se puede afirmar un depósito en el bolsillo."""
+    """De espaldas de verdad (orejas sin cara). Mirar al cesto no cuenta: la cara se oculta."""
     if contexto is None or not getattr(contexto, "personas", None):
-        return True
+        return False
     persona = max(contexto.personas, key=lambda p: p.altura)
     kp = persona.keypoints
-    if kp is None or len(kp) < 1:
-        return True
+    if kp is None or len(kp) < 5:
+        return False
     nariz = float(kp[0][2])
-    ojos = 0.0
-    orejas = 0.0
-    if len(kp) > 2:
-        ojos = max(float(kp[1][2]), float(kp[2][2]))
-    if len(kp) > 4:
-        orejas = max(float(kp[3][2]), float(kp[4][2]))
-    if nariz < 0.18 and ojos < 0.18:
-        return True
+    ojos = max(float(kp[1][2]), float(kp[2][2])) if len(kp) > 2 else 0.0
+    orejas = max(float(kp[3][2]), float(kp[4][2])) if len(kp) > 4 else 0.0
     return orejas >= 0.30 and nariz < 0.22 and ojos < 0.22
+
+
+def _munecas_visibles(contexto) -> bool:
+    """True solo si hay muñecas de frente. De espaldas YOLO-pose las inventa y no cuentan."""
+    if contexto is None or not getattr(contexto, "manos", None):
+        return False
+    if getattr(contexto, "personas", None) and _de_espaldas(contexto):
+        return False
+    return True
 
 
 def _deteccion_identificador_invalida(det: dict, ancho: int, alto: int) -> bool:
@@ -2724,6 +2705,8 @@ def detectar_objetos(frames, escena, detector, sam, args):
             alto, ancho = frame.shape[:2]
             contexto = ContextoEscena(ancho=ancho, alto=alto)
         contextos.append(contexto)
+        if getattr(contexto, "personas", None) and _de_espaldas(contexto):
+            contexto.manos = []
         if not contexto.manos:
             if indice % 20 == 0:
                 print(f"    frame {indice}: wrists below min_confidence, object model skipped")
@@ -3103,13 +3086,18 @@ def recortar_cola_si_salta(objetos: list[Objeto], contenedores=None, contextos=N
             dist = float(
                 np.hypot(vista.centro[0] - prev.centro[0], vista.centro[1] - prev.centro[1])
             )
+            if any(
+                _vista_en_mueble(objeto.vistas[k], contenedores, contextos)
+                for k in frames if k >= f
+            ):
+                continue
             if (f - prev_f) > max(3, 2 * paso) and dist > 80.0:
                 n_despues = sum(1 for k in frames if k >= f)
                 if n_despues <= 2:
                     corte = f
                     break
             salto_area = vista.area > 2.4 * max(1, prev.area)
-            if _vista_en_mueble(vista, contenedores, contextos) and not salto_area:
+            if _vista_en_mueble(vista, contenedores, contextos):
                 continue
             if prev.mano is None and dist > 56.0:
                 corte = f
@@ -3463,6 +3451,26 @@ def fusionar_objetos(objetos: list[Objeto], comunes_min: int = 1, solape_min: fl
     def en_mano(objeto: Objeto) -> int:
         return sum(1 for v in objeto.vistas.values() if v.mano)
 
+    def _parece_traspaso(a: Objeto, b: Objeto) -> bool:
+        """Misma pieza que pasa de una mano a la otra; no dos artículos a la vez."""
+        if not a.vistas or not b.vistas:
+            return False
+        la_a, la_b = max(a.vistas), max(b.vistas)
+        if abs(int(la_a) - int(la_b)) < 4:
+            return False
+        early, late = (a, b) if la_a < la_b else (b, a)
+        if min(early.vistas) >= min(late.vistas):
+            return False
+        manos_e = {v.mano for v in early.vistas.values() if v.mano in ("izquierda", "derecha")}
+        manos_l = {v.mano for v in late.vistas.values() if v.mano in ("izquierda", "derecha")}
+        if not manos_e or not manos_l or manos_e == manos_l:
+            return False
+        f_e = max(early.vistas)
+        f_l = min(late.vistas, key=lambda f: abs(int(f) - int(f_e)))
+        ve, vl = early.vistas[f_e], late.vistas[f_l]
+        dist = float(np.hypot(ve.centro[0] - vl.centro[0], ve.centro[1] - vl.centro[1]))
+        return dist < 280.0
+
     def _mismo_objeto(a: Objeto, b: Objeto) -> bool:
         comunes = set(a.vistas) & set(b.vistas)
         if comunes:
@@ -3475,7 +3483,7 @@ def fusionar_objetos(objetos: list[Objeto], comunes_min: int = 1, solape_min: fl
                 elif f in a.mascaras and f in b.mascaras and _solapan(a.mascaras[f], b.mascaras[f], 0.2):
                     cerca += 1
             if cerca / len(comunes) < solape_min:
-                return False
+                return _parece_traspaso(a, b)
             manos_a = {v.mano for v in a.vistas.values() if v.mano in ("izquierda", "derecha")}
             manos_b = {v.mano for v in b.vistas.values() if v.mano in ("izquierda", "derecha")}
             if manos_a and manos_b and manos_a.isdisjoint(manos_b):
@@ -3484,7 +3492,7 @@ def fusionar_objetos(objetos: list[Objeto], comunes_min: int = 1, solape_min: fl
                 if areas_a and areas_b:
                     ra, rb = float(np.median(areas_a)), float(np.median(areas_b))
                     if min(ra, rb) > 0 and max(ra, rb) > 2.2 * min(ra, rb):
-                        return False
+                        return _parece_traspaso(a, b)
             return True
         if not a.vistas or not b.vistas:
             return False
@@ -3523,18 +3531,21 @@ def fusionar_objetos(objetos: list[Objeto], comunes_min: int = 1, solape_min: fl
                         if {"izquierda", "derecha"} <= manos or "ambas" in manos:
                             ya.vistas[frame] = replace(prev, mano="ambas")
                     else:
-                        vecinos = [f for f in ya.vistas if abs(int(f) - int(frame)) <= 2]
-                        if vecinos:
-                            dmin = min(
-                                float(np.hypot(
-                                    vista.centro[0] - ya.vistas[f].centro[0],
-                                    vista.centro[1] - ya.vistas[f].centro[1],
-                                ))
-                                for f in vecinos
-                            )
-                            if dmin > 140.0:
-                                continue
-                        ya.vistas[frame] = vista
+                        if ya.vistas and int(frame) > int(max(ya.vistas)):
+                            ya.vistas[frame] = vista
+                        else:
+                            vecinos = [f for f in ya.vistas if abs(int(f) - int(frame)) <= 2]
+                            if vecinos:
+                                dmin = min(
+                                    float(np.hypot(
+                                        vista.centro[0] - ya.vistas[f].centro[0],
+                                        vista.centro[1] - ya.vistas[f].centro[1],
+                                    ))
+                                    for f in vecinos
+                                )
+                                if dmin > 160.0:
+                                    continue
+                            ya.vistas[frame] = vista
                     if frame in objeto.mascaras:
                         ya.mascaras.setdefault(frame, objeto.mascaras[frame])
                 print(f"  Objeto {objeto.id} se une al {ya.id}: mismo objeto a dos manos")
@@ -3558,14 +3569,6 @@ def trazar(objeto: Objeto, contextos, pista: dict, args) -> None:
             continue
         agarre = puntuar_manos(mascara, caja, contextos[idx], args)
         ys, xs = np.nonzero(mascara)
-        persona_id = -1
-        lado = agarre["mano"] if agarre["mano"] in ("izquierda", "derecha") else None
-        for mano in getattr(contextos[idx], "manos", []) or []:
-            if lado and mano.lado == lado and mano.persona_id >= 0:
-                persona_id = int(mano.persona_id)
-                break
-            if agarre["mano"] == "ambas" and mano.persona_id >= 0:
-                persona_id = int(mano.persona_id)
         objeto.vistas[idx] = Vista(
             frame=idx,
             caja=caja,
@@ -3575,7 +3578,6 @@ def trazar(objeto: Objeto, contextos, pista: dict, args) -> None:
             score=round(agarre["score"], 4),
             scores=agarre["scores"],
             origen="deteccion" if idx in pista["mascaras"] else "propagacion",
-            persona_id=persona_id,
         )
 
 
@@ -3588,15 +3590,6 @@ def _registrar_mascara(objeto: Objeto, indice: int, mascara, contextos, args,
         return
     agarre = puntuar_manos(mascara, caja, contextos[indice], args)
     ys, xs = np.nonzero(mascara)
-    persona_id = -1
-    ctx = contextos[indice]
-    lado = agarre["mano"] if agarre["mano"] in ("izquierda", "derecha") else None
-    for mano in getattr(ctx, "manos", []) or []:
-        if lado and mano.lado == lado and mano.persona_id >= 0:
-            persona_id = int(mano.persona_id)
-            break
-        if agarre["mano"] == "ambas" and mano.persona_id >= 0:
-            persona_id = int(mano.persona_id)
     objeto.mascaras[indice] = mascara
     objeto.vistas[indice] = Vista(
         frame=indice,
@@ -3607,7 +3600,6 @@ def _registrar_mascara(objeto: Objeto, indice: int, mascara, contextos, args,
         score=round(agarre["score"], 4),
         scores=agarre["scores"],
         origen=origen,
-        persona_id=persona_id,
     )
     objeto.ultimo_frame = max(objeto.ultimo_frame, indice)
     objeto.centro = (float(xs.mean()), float(ys.mean()))
@@ -4290,9 +4282,12 @@ def anotar(frames, destino: Path, objetos: list[Objeto], contenedores, fps_salid
                 if _overlay_objeto(o, indice, contenedores)[0] is not None
             )
             t = orig / fps_video if fps_video else 0.0
+            if ctx_i is None or not getattr(ctx_i, "manos", None):
+                texto_hud = f"frame {orig}  t={t:.2f}s  no-hands"
+            else:
+                texto_hud = f"frame {orig}  t={t:.2f}s  handheld objects: {activos}"
             cv2.putText(
-                frame,
-                f"frame {orig}  t={t:.2f}s  handheld objects: {activos}",
+                frame, texto_hud,
                 (12, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (240, 240, 240), 1, cv2.LINE_AA,
             )
             if escritor is not None:
@@ -4387,58 +4382,14 @@ def informe_objeto(objeto: Objeto, fps: float, nframes: int, contenedores, args,
         "final_state": estado_final(objeto, nframes, contenedor, args, contextos),
         "ends_in_container": contenedor is not None,
         "final_container": contenedor,
-        "person_id": (pid + 1) if (pid := _persona_id_objeto(objeto)) >= 0 else None,
         "events": eventos_en,
         "timeline": linea,
     }
 
 
-def _persona_id_objeto(objeto: Objeto) -> int:
-    votos: dict[int, int] = {}
-    for vista in objeto.vistas.values():
-        pid = int(getattr(vista, "persona_id", -1))
-        if pid >= 0:
-            votos[pid] = votos.get(pid, 0) + 1
-    if not votos:
-        return -1
-    return max(votos, key=votos.get)
-
-
-def informes_personas(contextos, informes: list[dict], objetos: list[Objeto]) -> list[dict]:
-    """Solo personas con muñecas visibles. Una entrada por track estable."""
-    stats: dict[int, dict] = {}
-    for ctx in contextos or []:
-        for mano in getattr(ctx, "manos", []) or []:
-            if mano.persona_id < 0 or mano.lado not in ("izquierda", "derecha"):
-                continue
-            item = stats.setdefault(int(mano.persona_id), {"frames": 0, "left": 0, "right": 0})
-            item["frames"] += 1
-            item["left" if mano.lado == "izquierda" else "right"] += 1
-    salida = []
-    tope = max((d["frames"] for d in stats.values()), default=0)
-    for tid, dato in sorted(stats.items()):
-        if dato["frames"] < 2:
-            continue
-        if tope and dato["frames"] < max(2, int(0.18 * tope)):
-            continue
-        objs = [
-            info for obj, info in zip(objetos, informes)
-            if _persona_id_objeto(obj) == tid
-        ]
-        salida.append({
-            "id": tid + 1,
-            "hands_visible": True,
-            "frames_with_wrists": dato["frames"],
-            "object_ids": [info["id"] for info in objs],
-            "final_state": _final_state_video(objs) if objs else "no_object",
-        })
-    return salida
-
-
 def resumen(video: Path, informes: list[dict], contenedores, nframes: int, modelo: str,
             yaml_identificadores: Path | None = None, muestreo: dict | None = None,
-            final_state: str | None = None, pose_backend: str = "yolo-pose",
-            personas: list[dict] | None = None) -> str:
+            final_state: str | None = None, pose_backend: str = "yolo-pose") -> str:
     lineas = [
         f"Video: {video}",
         f"Processed frames: {nframes}",
@@ -4500,15 +4451,6 @@ def resumen(video: Path, informes: list[dict], contenedores, nframes: int, model
         else:
             lineas.append("  does not end inside any container")
         lineas.append(f"  final_state: {info['final_state']}")
-    if personas:
-        lineas.append("")
-        lineas.append(f"People with visible wrists: {len(personas)}")
-        for persona in personas:
-            ids = persona.get("object_ids") or []
-            lineas.append(
-                f"  person {persona['id']}: objects {ids or 'none'}, "
-                f"final_state {persona.get('final_state')}"
-            )
     lineas.append(
         "\nLeft and right are the person's hands. «both» means both hands beat the "
         "grip threshold on the same frame."
@@ -4668,9 +4610,23 @@ def quedarse_con_agarrados(objetos: list[Objeto], args, contenedores=None, conte
             for ctx in contextos
         )
         es_celular = _objeto_es_celular(objeto, contenedores)
-        if _parece_mano_vacia(objeto, contextos) and not es_celular:
+        acaba_mueble = False
+        if contenedores and objeto.vistas:
+            dest_tmp = contenedor_final(
+                [objeto.vistas[i] for i in sorted(objeto.vistas)],
+                contenedores, args, contextos,
+            )
+            acaba_mueble = bool(
+                dest_tmp and dest_tmp.get("category") in ("cesto", "carrito", "bolsa")
+            )
+            if not acaba_mueble:
+                acaba_mueble = any(
+                    _vista_en_mueble(objeto.vistas[f], contenedores, contextos)
+                    for f in list(sorted(objeto.vistas))[-4:]
+                )
+        if _parece_mano_vacia(objeto, contextos) and not es_celular and not acaba_mueble:
             continue
-        if not es_celular and objeto.vistas:
+        if not es_celular and not acaba_mueble and objeto.vistas:
             areas = [v.area for v in objeto.vistas.values()]
             en_cabeza = 0
             for frame, vista in objeto.vistas.items():
@@ -4682,12 +4638,12 @@ def quedarse_con_agarrados(objetos: list[Objeto], args, contenedores=None, conte
                     en_cabeza += 1
             if areas and float(np.median(areas)) < 220 and en_cabeza / len(objeto.vistas) >= 0.5:
                 continue
-        if n < args.min_detecciones and not es_celular:
+        if n < args.min_detecciones and not es_celular and not acaba_mueble:
             if not ((sale_con_objeto or sale_clip) and n >= 2 and ultima.mano):
                 continue
-        if n / len(objeto.vistas) < 0.5 and not sale_con_objeto and not es_celular:
+        if n / len(objeto.vistas) < 0.5 and not sale_con_objeto and not es_celular and not acaba_mueble:
             continue
-        if not es_celular:
+        if not es_celular and not acaba_mueble:
             solidos = 0
             for frame, vista in objeto.vistas.items():
                 ctx_v = _contexto_en(contextos, int(frame)) if contextos is not None else None
@@ -4746,8 +4702,7 @@ def quedarse_con_agarrados(objetos: list[Objeto], args, contenedores=None, conte
     vivos = [principal]
     for objeto in candidatos[1:]:
         es_cel = _objeto_es_celular(objeto, contenedores)
-        empieza_antes = min(objeto.vistas) + 6 < min(principal.vistas)
-        if ppal_mueble and not _acaba_en_mueble(objeto) and not es_cel and not empieza_antes:
+        if ppal_mueble and not _acaba_en_mueble(objeto) and not es_cel:
             continue
         otra_mano = mano_dom(objeto) in ("izquierda", "derecha") and mano_dom(objeto) != mano_ppal
         if ppal_mueble and en_mano(objeto) < umbral and not es_cel and not otra_mano:
@@ -4922,7 +4877,6 @@ def escribir_salidas(
             for p in contenedores
         ],
         "objects": informes,
-        "people": extra.get("people") or informes_personas(contextos, informes, objetos),
     }
     if extra:
         for clave, valor in extra.items():
@@ -4934,7 +4888,6 @@ def escribir_salidas(
     texto = resumen(
         video, informes, contenedores, nframes, modelo, args.identificadores, muestreo,
         final_state=traza.get("final_state"), pose_backend=pose_backend,
-        personas=traza.get("people"),
     )
     (destino / "summary.txt").write_text(texto, encoding="utf-8")
     (destino / "metrics.json").write_text(
@@ -5031,7 +4984,7 @@ def procesar_video(
         escena, detector, sam, det_contenedores = detectores
         with medidor.etapa("segmentacion"):
             contextos, pistas = detectar_objetos(frames_proc, escena, detector, sam, args)
-            manos_visibles = any(bool(ctx.manos) for ctx in contextos)
+            manos_visibles = any(_munecas_visibles(ctx) for ctx in contextos)
             extra["hands_visible"] = manos_visibles
             if not manos_visibles:
                 extra["final_state"] = "no_hands"
@@ -5039,7 +4992,7 @@ def procesar_video(
                 contenedores = seguir_contenedores(
                     frames_proc, det_contenedores, args.cada_contenedor, contextos=contextos
                 )
-                print("  No wrists visible above min_confidence. Object model was not applied.")
+                print("  No wrists visible (back to camera or below min_confidence). final_state: no_hands")
             else:
                 try:
                     objetos = seguir(frames_proc, pistas, contextos, args)
