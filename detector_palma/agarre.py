@@ -125,7 +125,23 @@ def mascara_es_la_mano(instancia: Instancia, mano: Mano) -> bool:
     cubre_mano = (muneca and yemas_tocan >= 4) or (lms >= 0.85 * len(pts))
     if not cubre_mano:
         return False
-    return _fraccion_mascara_fuera(instancia.mascara, _caja_landmarks_mano(mano)) < 0.08
+    caja_lm = _caja_landmarks_mano(mano)
+    frac_fuera = _fraccion_mascara_fuera(instancia.mascara, caja_lm)
+    if frac_fuera < 0.08:
+        return True
+    # Palma vacía cuyo SAM se derrama un poco al muslo/pantalón.
+    if frac_fuera >= 0.35:
+        return False
+    ys, xs = np.nonzero(instancia.mascara)
+    if ys.size == 0:
+        return False
+    x1, y1, x2, y2 = caja_lm
+    fuera = (xs < x1) | (xs > x2) | (ys < y1) | (ys > y2)
+    y_palma = float((mano.palma or mano.punto)[1])
+    n_fuera = int(np.count_nonzero(fuera))
+    if n_fuera == 0:
+        return False
+    return int(np.count_nonzero(ys[fuera] > y_palma)) / n_fuera >= 0.70
 
 
 def _encuadre_en_persona(caja: Caja, contexto: ContextoEscena) -> float:

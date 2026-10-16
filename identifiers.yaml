@@ -34,7 +34,7 @@
 # the empty hand itself (landmarks cover the mask) rather than a grasped object.
 
 hands:
-  min_confidence: 0.20
+  min_confidence: 0.50
 
 identifiers:
   carrito:

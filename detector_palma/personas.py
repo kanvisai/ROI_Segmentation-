@@ -419,7 +419,7 @@ class AnalizadorEscena:
         radio_mano: float = 0.22,
         conf: float = 0.25,
         imgsz: int = 640,
-        conf_mano: float = 0.20,
+        conf_mano: float = 0.50,
     ):
         self.padding_persona = padding_persona
         self.radio_mano = radio_mano
@@ -703,6 +703,12 @@ class AnalizadorEscena:
             )
             por_lado = {m.lado: m for m in pose_manos}
             por_lado.update({m.lado: m for m in mp_manos})
+            if len(mp_manos) >= 2:
+                p0 = mp_manos[0].palma or mp_manos[0].punto
+                p1 = mp_manos[1].palma or mp_manos[1].punto
+                if float(np.hypot(p0[0] - p1[0], p0[1] - p1[1])) < 28.0 and pose_manos:
+                    # Las dos palmas de Hands caen en el mismo punto: se conservan las muñecas de pose.
+                    por_lado = {m.lado: m for m in pose_manos}
             contexto.manos.extend(por_lado.values())
         elif mp_manos:
             # Pose Holistic inestable: se conserva YOLO-pose y solo se actualizan los dedos.

@@ -45,7 +45,7 @@ from pipeline_manos import (
 4. Puntúa agarre contra las dos manos (`izquierda` / `derecha` / `ambas`). Dos recortes de la misma pieza se fusionan en un solo objeto.
 5. Detecta identificadores de escena en el **frame completo** según `identifiers.yaml` (YOLO cerrado + YOLOE open-vocab). El bolsillo no sale de YOLO: se sintetiza con las caderas de la pose (`body: true`).
 6. El backend **sigue o redetecta** la máscara del objeto. Si las muñecas no superan `hands.min_confidence`, ese frame no ejecuta el modelo de objeto.
-7. El último frame visible decide el depósito (`ends_in_container`, `final_container`): primero mueble (cesto/carrito/bolsa útil); el bolsillo solo con gesto de meter la mano; bolso/mochila no se usan como destino de reserva. Si la persona sale de escena o se pone de espaldas, no se infiere bolsillo (`final_state` queda `in_hand` o `released`).
+7. El último frame visible decide el depósito (`ends_in_container`, `final_container`): primero mueble (cesto/carrito/bolsa útil); el bolsillo solo con gesto de meter la mano; bolso/mochila no se usan como destino de reserva. Si acaba en el bolsillo o deja de verse en las palmas, `final_state` es `disappeared`. Si la persona sale de escena o se pone de espaldas con el objeto aún en la mano, `final_state` queda `in_hand`.
 8. Escribe vídeo anotado, `tracking.json`, `summary.txt`, `metrics.json` y una fila en la comparativa. Si nunca hay muñecas, `final_state` es `no_hands`. Un clip que falle no aborta el lote (`procesar_lote`).
 
 Cutie y Track-Anything **propagan** la semilla. YOLO26-seg, SAM 3 y HOIST **redetectan** cada frame (`seguir_por_deteccion`). VISOR no usa este pipeline: corre su propio HOS + Faster R-CNN.
@@ -327,7 +327,7 @@ Todos salvo VISOR llaman a `anadir_argumentos_comunes`. VISOR replica `--videos`
 | `--width` / `--height` | se infieren del array | Enteros ≥ 1. Con arrays son el tamaño; si se pasan deben coincidir. Con mp4, si se pasan deben coincidir con el archivo. |
 | `--salida` | `salidas` | Raíz de resultados. |
 | `--identificadores` | `identifiers.yaml` | Catálogo de escena + `hands.min_confidence`. |
-| `--mediapipe` | off | MediaPipe Holistic (pose + manos) en el recorte de persona, en lugar de YOLO-pose. Rechaza mejor la mano vacía. El umbral de muñecas es `hands.min_confidence` (0.20). |
+| `--mediapipe` | off | MediaPipe Holistic (pose + manos) en el recorte de persona, en lugar de YOLO-pose. Rechaza mejor la mano vacía. El umbral de muñecas es `hands.min_confidence` (0.50). |
 | `--fps N\|half\|third` | omitido = frame a frame (solo mp4) | Entero, `half` o `third`. Con mp4: muestreo (`half`/`third` = la mitad o un tercio del fps del archivo). Con `--frames`: fps entero de la línea temporal (**obligatorio**). Ver [Muestreo `--fps`](#muestreo---fps). |
 | `--max-frames` | ninguno | Corta la lectura del vídeo de origen (antes del muestreo). No aplica a arrays en memoria. |
 | `--sin-sam` | off | No usa MobileSAM. |
@@ -456,7 +456,7 @@ Detección inmediata en el **frame completo**. Los campos del YAML van en inglé
 
 ```yaml
 hands:
-  min_confidence: 0.20
+  min_confidence: 0.50
 
 identifiers:
   celular:
@@ -502,7 +502,7 @@ Filtros extra (no son flags): se tiran móviles débiles o que no están junto a
    - el objeto no acaba de estar lejos del cuerpo (estantería).
 3. **Bolso / mochila** (`accessory: true`): se detectan y se pintan si van sobre la persona, pero no se usan como destino si el objeto no llega de verdad. Una mochila al fondo del pasillo no “traga” lo que se deja en la estantería.
 
-Si el último frame del objeto sigue en la mano y la persona se va o se da la vuelta, `final_state` es `in_hand`, no `inside_container`. Si lo suelta (estantería), es `released`.
+Si el objeto acaba en el **bolsillo**, o se estaba siguiendo desde las manos y deja de verse en las palmas, `final_state` es `disappeared` (el `final_container` del bolsillo se conserva). Cesto/carrito/bolsa siguen siendo `inside_container`. Si el último frame del objeto sigue en la mano y la persona se va o se da la vuelta, `final_state` es `in_hand`. Si lo deja visible en una estantería, es `released`.
 
 En el vídeo anotado el ROI del bolsillo **solo se pinta** cuando el gesto está activo. No se pinta el bolsillo del lado cuya mano sostiene un objeto, ni si el ROI del bolsillo solapa ese objeto.
 
@@ -646,7 +646,7 @@ contextos, pistas = detectar_objetos(frames, escena, detector, sam, args)
 - **Objeto fusionado con bolso de hombro.** `accessory: true` en el YAML y `descartar_accesorios` en el pipeline. El ROI del bolso se ancla a la persona; una detección lejana de 1 frame se tira.
 - **Mochila lejana como destino.** Ya no. `accessory: true` no es depósito de reserva: dejar un artículo en la estantería no lo mete en una mochila al fondo del pasillo.
 - **Bolsillo vs cesto.** Agacharse al cesto no cuenta como meter la mano en el bolsillo. Gana el mueble. El ROI del bolsillo no se pinta si esa mano sostiene el objeto.
-- **Persona que sale o se da la vuelta.** No se infiere `inside_container` en el bolsillo: `in_hand` o `released`.
+- **Persona que sale o se da la vuelta.** Si el último evidencia sigue en la mano: `in_hand`. Bolsillo o pérdida en las palmas: `disappeared`, no `inside_container`.
 - **Packs de latas como cesto/bolsa.** YOLOE en el borde inferior se filtra por score, tamaño y posición.
 - **HOIST no compila.** Hace falta el truco `third_party/nvcc-wrap` o el fallback PyTorch de atención deformable.
 - **Cutie `No está el código`.** Falta el clone en `third_party/Cutie`.
