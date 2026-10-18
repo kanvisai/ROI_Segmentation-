@@ -39,13 +39,13 @@ from pipeline_manos import (
 
 ## Qué hace el sistema
 
-1. Localiza muñecas con **YOLO26n-pose** o, con `--mediapipe`, MediaPipe Holistic sobre el recorte de persona.
-2. Recorta una ventana alrededor de cada palma (`--padding-muneca`, `--crop-min`).
-3. Dentro de ese recorte busca el objeto (YOLO26n-seg + MobileSAM opcional).
-4. Puntúa agarre contra las dos manos (`izquierda` / `derecha` / `ambas`). Dos recortes de la misma pieza se fusionan en un solo objeto.
+1. Localiza **una** persona (la de mayor altura) y sus muñecas con **YOLO26n-pose** o, con `--mediapipe`, MediaPipe Holistic sobre el recorte de persona. No hay seguimiento multi-persona.
+2. Recorta una ventana alrededor de cada palma (`--padding-muneca`, `--crop-min`). Si el brazo alcanza una estantería (palma fuera del bbox), el recorte se aprieta para no comerse la balda.
+3. Dentro de ese recorte busca el objeto (YOLO26n-seg + MobileSAM opcional). No se busca en una palma abierta que cuelga al costado. Un puño que vuelve al torso sí se busca.
+4. Puntúa agarre contra las dos manos (`izquierda` / `derecha` / `ambas`). Dos recortes de la misma pieza se fusionan en un solo objeto. Un bulto de ropa en la cadera **no** se fusiona con un agarre posterior de la otra mano.
 5. Detecta identificadores de escena en el **frame completo** según `identifiers.yaml` (YOLO cerrado + YOLOE open-vocab). El bolsillo no sale de YOLO: se sintetiza con las caderas de la pose (`body: true`).
-6. El backend **sigue o redetecta** la máscara del objeto. Si las muñecas no superan `hands.min_confidence`, ese frame no ejecuta el modelo de objeto.
-7. El último frame visible decide el depósito (`ends_in_container`, `final_container`): primero mueble (cesto/carrito/bolsa útil); el bolsillo solo con gesto de meter la mano; bolso/mochila no se usan como destino de reserva. Si acaba en el bolsillo o deja de verse en las palmas, `final_state` es `disappeared`. Si la persona sale de escena o se pone de espaldas con el objeto aún en la mano, `final_state` queda `in_hand`.
+6. El backend **sigue o redetecta** la máscara del objeto. Si las muñecas no superan `hands.min_confidence` (0.50 en el YAML), ese frame no ejecuta el modelo de objeto.
+7. El último frame visible decide el depósito y el `final_state` (ver [Estado final](#estado-final-del-objeto)). Mueble primero; bolsillo solo con gesto; bolso/mochila no son destino de reserva.
 8. Escribe vídeo anotado, `tracking.json`, `summary.txt`, `metrics.json` y una fila en la comparativa. Si nunca hay muñecas, `final_state` es `no_hands`. Un clip que falle no aborta el lote (`procesar_lote`).
 
 Cutie y Track-Anything **propagan** la semilla. YOLO26-seg, SAM 3 y HOIST **redetectan** cada frame (`seguir_por_deteccion`). VISOR no usa este pipeline: corre su propio HOS + Faster R-CNN.
@@ -106,11 +106,14 @@ cargar_detectores(args)
         |
         v
 detectar_objetos()  → contextos por frame + pistas (máscaras semilla)
+  # palma vacía / ropa en cadera / balda en el recorte se tiran aquí
 seguir(...) o seguir_por_deteccion()  → list[Objeto]   # lo único que cambia el backend
 seguir_contenedores()                 # YOLO/YOLOE + bolsillo de pose; cose/ancla accesorios
 recortar saltos a bolsa o cadera / sembrar celular junto a la palma
 completar_deposito()                  # sigue el objeto si la mano entra en un cesto
-descartar_accesorios / fusionar_objetos / quedarse_con_agarrados
+extender_si_sigue_en_mano / rellenar_huecos_en_mano
+quedarse_con_agarrados                # tira bultos estáticos de cadera; se reejecuta tras fusionar
+fusionar_objetos                      # no pega un bulto de cadera con un agarre de la otra mano
 descartar_falsos_bolsillo             # si hay cesto, no se deja un fantasma en el bolsillo
         |
         v
@@ -131,7 +134,9 @@ Funciones clave de `pipeline_manos.py` para un integrador:
 | `offsets_muestreo` / `describir_muestreo` / `frame_origen` | Muestreo `--fps` y remap a índices del vídeo original. |
 | `detectar_objetos(frames, escena, detector, sam, args)` | Pistas semilla. |
 | `seguir_por_deteccion(...)` | Backend nulo: la máscara de cada frame es la del detector. |
-| `fusionar_objetos(...)` | Une dos pistas de la misma pieza (p. ej. las dos manos sobre una botella). |
+| `fusionar_objetos(...)` | Une dos pistas de la misma pieza (p. ej. las dos manos sobre una botella). No fusiona un bulto en la cadera con un agarre posterior. |
+| `quedarse_con_agarrados(...)` | Se queda con el objeto principal; descarta palmas vacías y bultos de ropa en la cadera. |
+| `estado_final(...)` | `in_hand` / `disappeared` / `inside_container` / `released` / `no_data`. El clip puede ser `no_hands` si no hay muñecas. |
 | `contenedor_final(...)` | Destino del último frame: mueble primero, bolsillo solo con gesto. |
 | `procesar_video(...)` | Orquesta un clip (mp4 o arrays). Kwargs: `frames`, `frames_origin`, `fps`, `width`, `height`. |
 | `procesar_lote(...)` | Varios clips o una lista de arrays; un fallo no aborta el resto. Devuelve cuántos fallaron. |
@@ -258,13 +263,13 @@ Salida: `salidas/track_anything/<clip>/`. Fila: `Track-Anything`.
 
 ### SAM 3 — `sam3_mano_objeto.py`
 
-Usa el pipeline común (`seguir_por_deteccion`). Umbrales de agarre un poco más estrictos por defecto (`min_detecciones=3`, `contacto_min=0.12`, `area_max_persona=0.02`, …) para no pegar bolsos de hombro u objetos de balda al objeto de la palma. En laboratorio se suele lanzar con `--mediapipe --fps 3`.
+Usa el pipeline común (`seguir_por_deteccion`). Umbrales de agarre un poco más estrictos por defecto (`min_detecciones=3`, `contacto_min=0.12`, `area_max_persona=0.02`, `distancia_max=280`, …) para no pegar bolsos de hombro u objetos de balda al objeto de la palma. Receta de laboratorio: `--identificadores identifiers.yaml --mediapipe --fps 3`. Si un clip es más rápido (traspaso corto, depósito en cesto), `--fps half` o `--fps third`.
 
 ```bash
 source .venv/bin/activate
 hf auth login   # solo si se va a descargar facebook/sam3.1
-python sam3_mano_objeto.py --videos videos --salida salidas
-python sam3_mano_objeto.py --video videos/6_clip_2.mp4 --mediapipe --fps 3 --salida salidas
+python sam3_mano_objeto.py --videos videos --identificadores identifiers.yaml --mediapipe --fps 3 --salida salidas
+python sam3_mano_objeto.py --video videos/6_clip_2.mp4 --identificadores identifiers.yaml --mediapipe --fps 3 --salida salidas
 ```
 
 Extra CLI: `--version {sam3.1,sam3}`, `--lote`. Salida: `salidas/sam3/<clip>/`. Fila: `SAM 3`.
@@ -321,7 +326,7 @@ Todos salvo VISOR llaman a `anadir_argumentos_comunes`. VISOR replica `--videos`
 | Flag | Default | Significado |
 |---|---|---|
 | `--videos` | `videos` | Carpeta de clips. |
-| `--video` | ninguno | Un solo mp4 (opcional si hay `frames`). Con arrays solo nombra la carpeta de salida. |
+| `--video` | ninguno | Un solo mp4 (opcional si hay `frames`). Con arrays solo nombra la carpeta de salida. Si se pasa varias veces, argparse se queda con el **último**. |
 | `--frames` | ninguno | **API Python**, no flag de shell: `list[np.ndarray]` BGR (`args.frames` o `frames=`). Si está definida, el mp4 no hace falta. |
 | `--frames-origin` | `0…N-1` | `list[int]`: índice de origen de cada array. Misma longitud que `--frames`. |
 | `--width` / `--height` | se infieren del array | Enteros ≥ 1. Con arrays son el tamaño; si se pasan deben coincidir. Con mp4, si se pasan deben coincidir con el archivo. |
@@ -344,13 +349,13 @@ Todos salvo VISOR llaman a `anadir_argumentos_comunes`. VISOR replica `--videos`
 | `--padding-muneca` | `1.2` | Semilado del recorte = 1.2 × radio del brazo. |
 | `--crop-min` | `96` | Semilado mínimo en píxeles. |
 | `--factor-palma` | `0.85` | Radio de **aceptación**: el objeto tiene que estar pegado a la palma, no basta con caer en el recorte. |
-| `--conf-pose` / `--conf-objeto` / `--conf-objeto-crop` | 0.25 / 0.25 / 0.12 | |
+| `--conf-pose` / `--conf-objeto` / `--conf-objeto-crop` | 0.25 / 0.25 / 0.12 | SAM 3 usa `conf_objeto_crop` 0.15. |
 | `--imgsz` | 640 | |
-| `--area-min` / `--area-max-px` / `--area-max-persona` | 80 / 6000 / 0.05 | Filtro de tamaño (evita brazos, baldas, carritos como “objeto en mano”). |
+| `--area-min` / `--area-max-px` / `--area-max-persona` | 80 / 6000 / 0.05 | Filtro de tamaño (evita brazos, baldas, carritos como “objeto en mano”). SAM 3 usa 5000 / 0.02. |
 | `--relacion-max` / `--relleno-min` | 3.0 / 0.3 | Forma compacta. |
-| `--umbral-agarre` / `--contacto-min` | 0.35 / 0.10 | Score y contacto palma/dedos. |
-| `--min-detecciones` | 2 | Pistas más cortas se tiran. |
-| `--hueco-max` / `--distancia-max` | 45 / 180 | Asociación temporal de detecciones. |
+| `--umbral-agarre` / `--contacto-min` | 0.35 / 0.10 | Score y contacto palma/dedos. SAM 3 usa `contacto_min` 0.12. |
+| `--min-detecciones` | 2 | Pistas más cortas se tiran. SAM 3 sube a 3. |
+| `--hueco-max` / `--distancia-max` | 45 / 180 | Asociación temporal de detecciones. SAM 3 sube `distancia_max` a 280. |
 | `--frames-traspaso` / `--hueco-parpadeo` | 3 / 3 | Eventos de cambio de mano y huecos. |
 
 ### Identificadores de escena
@@ -483,9 +488,45 @@ identifiers:
 
 Ids Ultralytics COCO (contiguos 0–79), no los ids “paper” de COCO: `24` backpack, `26` handbag, `66` **keyboard**, `67` **cell phone**. El móvil es **67**. Carrito, cesto y bolsa no están en COCO: solo YOLOE.
 
-Por defecto en este repo: carrito, cesto, bolso, mochila, bolsa, celular y bolsillo activos. Destinos en verde; el resto (p. ej. celular) en cian. El bolsillo se estima con las caderas de la pose (COCO 11/12). MediaPipe también descarta máscaras que son la mano vacía (los landmarks cubren la máscara).
+Por defecto en este repo: carrito, cesto, bolso, mochila, bolsa, celular y bolsillo activos. Destinos en verde; el resto (p. ej. celular) en cian. El bolsillo se estima con las caderas de la pose (COCO 11/12). MediaPipe también descarta máscaras que son la mano vacía (los landmarks cubren la máscara). Si dos palmas de MediaPipe salen a menos de 28 px, se conservan las muñecas de la pose.
 
 Filtros extra (no son flags): se tiran móviles débiles o que no están junto a una palma; cestos/bolsas en el borde de la imagen con score bajo (p. ej. packs de latas); accesorios de 1 muestra lejos de la persona (ROI congelado en el pasillo). El bolso/mochila se **ancla** a la persona cuando sí está sobre ella, para que el ROI no se quede quieto.
+
+---
+
+## Objeto en la mano: qué se acepta y qué se tira
+
+El recorte de muñeca es amplio a propósito (estantería, puño, traspaso). La aceptación es estricta:
+
+- **Confianza de muñeca.** `hands.min_confidence: 0.50` en el YAML. Por debajo no se lanza SAM/YOLO en esa palma. Si **ninguna** muñeca supera el umbral en todo el clip (de espaldas desde el primer frame), `final_state: no_hands` y no hay objetos.
+- **Una persona.** Se usa la de mayor altura. El seguimiento multi-persona está desactivado.
+- **Palma abierta colgando** (brazo vertical junto al muslo): no se busca objeto. Un puño o una palma que **vuelve al torso** después de alcanzar la estantería sí.
+- **Ropa / muslo / puño vacío.** MediaPipe con landmarks: si la máscara es la mano, se tira. Un SAM pegado a una palma que cuelga y cuyo centro cae en la palma se trata como puño vacío, no como artículo. Un objeto real con color distinto (p. ej. un pack en el puño de perfil) se conserva.
+- **Balda en el recorte.** Si el brazo está lejos del torso, un blob más lejos de la palma que la propia palma (cartel, góndola) se rechaza o se recorta al disco de la palma.
+- **Bulto estático en la cadera.** Una mancha de ropa o de puño vacío que no se aleja del torso (persona quieta, manos libres) no es un agarre. Se filtra **después** de fusionar pistas, para no unir dos fantasmas cortos en uno largo. Excepción: el artículo real que acaba escondido a la espalda o dentro del ROI de la persona.
+- **No pegar cadera con agarre.** Un bulto en la cadera de una mano no se asocia ni se fusiona con un alcance posterior de la otra (o de la misma cuando el brazo sí se aleja).
+- **No arrastrar el ROI.** `extender_si_sigue_en_mano` no traduce la caja si la palma vuelve pegada al torso: evita que un fantasma de cadera crezca hasta tapar el agarre real.
+
+---
+
+## Estado final del objeto
+
+`final_state` (inglés en JSON y `summary.txt`) se escribe en la cabecera del clip y en cada objeto. El del clip se decide así, en este orden:
+
+| Condición | `final_state` |
+|---|---|
+| Nunca hay muñecas por encima de `hands.min_confidence` | `no_hands` |
+| No queda ningún objeto en mano | `no_data` |
+| El último ROI está en un **bolsillo** (con gesto) | `disappeared` (`ends_in_container` true; `final_container` es el bolsillo) |
+| El último ROI está en **cesto / carrito / bolsa** de depósito | `inside_container` |
+| Se siguió en la palma y esa mano se esconde **a la espalda** (codo abierto, no un brazo colgando) | `disappeared` |
+| Se siguió en la palma y después las mismas palmas están a la vista vacías (abiertas, colgando o libres en pose) | `disappeared` |
+| Se cogió algo (brazo lejos del torso), el último ROI entra en la persona y las manos quedan libres | `disappeared` |
+| El último frame visible sigue en la mano, y la persona se va o se da la vuelta **con el objeto** | `in_hand` |
+| El objeto queda visible lejos del cuerpo (estantería) | `released` |
+| Estuvo en la mano y deja de verse sin las condiciones de arriba | `disappeared` |
+
+Un brazo **colgando al costado** no cuenta como “detrás del tronco”. Si la persona se gira de espaldas **después** de esconder el artículo en el cuerpo, sigue siendo `disappeared`, no `in_hand`.
 
 ---
 
@@ -502,7 +543,7 @@ Filtros extra (no son flags): se tiran móviles débiles o que no están junto a
    - el objeto no acaba de estar lejos del cuerpo (estantería).
 3. **Bolso / mochila** (`accessory: true`): se detectan y se pintan si van sobre la persona, pero no se usan como destino si el objeto no llega de verdad. Una mochila al fondo del pasillo no “traga” lo que se deja en la estantería.
 
-Si el objeto acaba en el **bolsillo**, o se estaba siguiendo desde las manos y deja de verse en las palmas, `final_state` es `disappeared` (el `final_container` del bolsillo se conserva). Cesto/carrito/bolsa siguen siendo `inside_container`. Si el último frame del objeto sigue en la mano y la persona se va o se da la vuelta, `final_state` es `in_hand`. Si lo deja visible en una estantería, es `released`.
+Si el objeto acaba en el **bolsillo**, o se estaba siguiendo desde las manos y deja de verse en las palmas (o se oculta en el ROI de la persona / a la espalda), `final_state` es `disappeared` (el `final_container` del bolsillo se conserva). Cesto/carrito/bolsa siguen siendo `inside_container`. Si el último frame del objeto sigue en la mano y la persona se va o se da la vuelta **sosteniéndolo**, `final_state` es `in_hand`. Si lo deja visible en una estantería, es `released`.
 
 En el vídeo anotado el ROI del bolsillo **solo se pinta** cuando el gesto está activo. No se pinta el bolsillo del lado cuya mano sostiene un objeto, ni si el ROI del bolsillo solapa ese objeto.
 
@@ -522,7 +563,9 @@ Por clip y tecnología, en `salidas/<tecnologia>/<stem>/`:
 
 ### `tracking.json` (pipeline común)
 
-Cabecera: `video`, `model`, `width`, `height`, `frames`, `source_frames`, `fps`, `output_fps`, `sampling`, `pose_backend`, `hands_visible`, `final_state`, `parameters`, `identifiers_yaml`.
+Cabecera: `video`, `model`, `width`, `height`, `frames`, `source_frames`, `fps`, `output_fps`, `sampling`, `pose_backend` (`yolo-pose` o `mediapipe`), `hands_visible` (bool), `final_state` (del clip), `parameters`, `identifiers_yaml`.
+
+`final_state` del clip: si no hay muñecas, `no_hands`. Si hay muñecas pero ningún objeto, `no_data`. Si hay varios objetos, gana el de mayor prioridad (`inside_container` > `in_hand` > `released` > `disappeared`). `parameters.hand_min_confidence` y `parameters.mediapipe` reflejan el YAML y `--mediapipe`.
 
 Con mp4, `fps` es el del archivo (float) y `parameters.fps` es el `--fps` de muestreo (o `null`). Con arrays, `fps` y `parameters.fps` son el entero de la línea temporal; `parameters.input` es `"frames"`; `parameters.frames_origin` es la `list[int]`; `parameters.width` / `parameters.height` son enteros. `width` y `height` de la cabecera también son enteros.
 
@@ -616,7 +659,7 @@ contextos, pistas = detectar_objetos(frames, escena, detector, sam, args)
 
 ## Recetas de laboratorio
 
-`scripts.txt` guarda comandos reales. Patrón habitual: `--videos videos --identificadores identifiers.yaml --salida salidas`. Para un clip:
+`scripts.txt` guarda comandos reales. Receta de laboratorio (SAM 3, MediaPipe, 3 muestras por segundo):
 
 ```bash
 .venv/bin/python sam3_mano_objeto.py \
@@ -626,13 +669,15 @@ contextos, pistas = detectar_objetos(frames, escena, detector, sam, args)
   --salida salidas
 ```
 
+`--fps 3` es el valor por defecto en esos clips. Usar `--fps half` o `--fps third` si el gesto es más denso (traspaso corto, depósito en cesto). Varios `--video` no se acumulan: gana el último. Para un lote, `--videos videos`.
+
 ---
 
 ## Vídeos de prueba (locales, no en git)
 
 - `videos/clip.mp4`: objeto en la mano izquierda y traspaso a la derecha.
 - `videos/clip_2.mp4`: misma tarea, segundo clip.
-- En el laboratorio hay series `N_clip_M.mp4` (p. ej. `3_clip_3.mp4`, `6_clip_2.mp4`) usadas en la comparativa de 43 clips.
+- En el laboratorio hay series `N_clip_M.mp4` (p. ej. `3_clip_3.mp4`, `6_clip_2.mp4`) usadas en la comparativa de 43 clips, y clips `6_clip_r*.mp4` / `fp_*.mp4` de depuración (palma vacía, bolsillo, espalda, estantería).
 - `fp_agosto2026/fp_*.mp4`: clips de depuración (depósito en cesto vs bolsillo, salida de escena, accesorios lejanos).
 
 ---
@@ -642,11 +687,14 @@ contextos, pistas = detectar_objetos(frames, escena, detector, sam, args)
 - **`python` no es el venv.** Pose26 / YOLO26 fallan. Usar `.venv/bin/python` o `source .venv/bin/activate`.
 - **Celular id 66.** En Ultralytics 66 es `keyboard`. Usar `name: cell phone` (id 67). El código resuelve por nombre.
 - **Móvil fantasma.** Un `celular` débil pegado al objeto de la estantería se descarta. Hace falta score alto y palma cerca.
-- **Ruido en SAM 3 / recorte grande.** El recorte de muñeca es amplio (`padding-muneca` 1.2); la aceptación es `factor-palma` 0.85 sobre el radio del brazo. No ampliar el factor sin refiltrar agarre.
+- **Ruido en SAM 3 / recorte grande.** El recorte de muñeca es amplio (`padding-muneca` 1.2, `crop-min` 96); la aceptación es `factor-palma` 0.85 sobre el radio de la palma (tope 88 px). Si el brazo alcanza la góndola, el recorte se reduce. No ampliar el factor sin refiltrar agarre.
+- **Objeto fantasma en la cadera (manos vacías, persona quieta).** SAM se come el pantalón o el puño. El pipeline tira palmas abiertas que cuelgan, máscaras que son la mano, bultos estáticos en la cadera (después de fusionar) y no pega ese bulto con un agarre posterior. No bajar `hands.min_confidence`: 0.50 evita buscar en muñecas dudosas.
+- **SAM se come la estantería al alargar el brazo.** Un blob más lejos del torso que la palma se rechaza o se recorta al disco de la palma. El agarre real queda en la mano, no en el cartel.
 - **Objeto fusionado con bolso de hombro.** `accessory: true` en el YAML y `descartar_accesorios` en el pipeline. El ROI del bolso se ancla a la persona; una detección lejana de 1 frame se tira.
 - **Mochila lejana como destino.** Ya no. `accessory: true` no es depósito de reserva: dejar un artículo en la estantería no lo mete en una mochila al fondo del pasillo.
 - **Bolsillo vs cesto.** Agacharse al cesto no cuenta como meter la mano en el bolsillo. Gana el mueble. El ROI del bolsillo no se pinta si esa mano sostiene el objeto.
-- **Persona que sale o se da la vuelta.** Si el último evidencia sigue en la mano: `in_hand`. Bolsillo o pérdida en las palmas: `disappeared`, no `inside_container`.
+- **Persona que sale o se da la vuelta.** Si el último evidencia sigue en la mano: `in_hand`. Bolsillo, pérdida en las palmas, ocultación en el ROI de la persona o mano a la espalda: `disappeared`, no `inside_container`. Un brazo colgando no es “a la espalda”.
+- **Muñecas nunca visibles.** De espaldas o por debajo de 0.50: `final_state: no_hands`, sin objetos. Si antes se vio objeto+manos y luego se gira **sosteniéndolo**, es `in_hand`, no `no_hands`.
 - **Packs de latas como cesto/bolsa.** YOLOE en el borde inferior se filtra por score, tamaño y posición.
 - **HOIST no compila.** Hace falta el truco `third_party/nvcc-wrap` o el fallback PyTorch de atención deformable.
 - **Cutie `No está el código`.** Falta el clone en `third_party/Cutie`.
