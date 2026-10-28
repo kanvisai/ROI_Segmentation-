@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import traceback
 from copy import copy
@@ -110,6 +111,7 @@ class ConfigManos:
     """Umbral de visibilidad de muñecas / manos leído del YAML."""
 
     min_confidence: float = 0.50
+    min_hand_confidence: float = 0.30
 
 
 def _aviso(mensaje: str) -> None:
@@ -148,7 +150,17 @@ def cargar_catalogo(ruta: Path) -> tuple[list[Identificador], ConfigManos]:
     except (TypeError, ValueError) as exc:
         raise SystemExit(f"hands.min_confidence inválido en {ruta}: {min_conf!r}") from exc
     min_conf = min(1.0, max(0.0, min_conf))
-    config_manos = ConfigManos(min_confidence=min_conf)
+    min_dedos = manos_raw.get(
+        "min_hand_confidence", manos_raw.get("min_confianza_mano", 0.30)
+    )
+    try:
+        min_dedos = float(min_dedos)
+    except (TypeError, ValueError) as exc:
+        raise SystemExit(
+            f"hands.min_hand_confidence inválido en {ruta}: {min_dedos!r}"
+        ) from exc
+    min_dedos = min(1.0, max(0.0, min_dedos))
+    config_manos = ConfigManos(min_confidence=min_conf, min_hand_confidence=min_dedos)
     catalogo: list[Identificador] = []
     for clave, raw in bloque.items():
         if not isinstance(raw, dict):
@@ -492,14 +504,61 @@ def _fps_salida_frames(fps: float, indices_origen: list[int]) -> float:
     return float(fps)
 
 
+_NUMERO_FRAME = re.compile(r"(\d+)$")
+
+
+def cargar_carpeta_frames(carpeta: Path) -> tuple[list[np.ndarray], list[int]]:
+    """Lee JPEG/PNG de una carpeta. El índice de origen sale del número del nombre."""
+    carpeta = Path(carpeta)
+    if not carpeta.is_dir():
+        raise SystemExit(f"No existe la carpeta {carpeta}")
+    rutas = sorted(
+        p for p in carpeta.iterdir()
+        if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png"}
+    )
+    if not rutas:
+        raise SystemExit(f"No hay imágenes en {carpeta}")
+    frames: list[np.ndarray] = []
+    origen: list[int] = []
+    for ruta in rutas:
+        img = cv2.imread(str(ruta))
+        if img is None:
+            raise SystemExit(f"No se pudo leer {ruta}")
+        frames.append(img)
+        m = _NUMERO_FRAME.search(ruta.stem)
+        origen.append(int(m.group(1)) if m else len(origen))
+    return frames, origen
+
+
+def _fps_linea_temporal(fps) -> int:
+    if fps is None or fps in ("half", "third"):
+        raise SystemExit(
+            "--carpeta-frames / --frames require --fps as an integer >= 1 "
+            "(timeline clock, e.g. --fps 12). half/third only apply to mp4."
+        )
+    return int(fps)
+
+
 def entrada_en_memoria(args, frames=None) -> bool:
-    return frames is not None or getattr(args, "frames", None) is not None
+    return (
+        frames is not None
+        or getattr(args, "frames", None) is not None
+        or getattr(args, "carpeta_frames", None) is not None
+    )
+
+
+def _nombre_salida_frames(args) -> Path:
+    if getattr(args, "video", None) is not None:
+        return Path(args.video)
+    carpeta = getattr(args, "carpeta_frames", None)
+    if carpeta is not None:
+        return Path(Path(carpeta).name)
+    return Path("frames")
 
 
 def resolver_videos(args) -> list[Path]:
     if entrada_en_memoria(args):
-        nombre = args.video if getattr(args, "video", None) is not None else Path("frames")
-        return [Path(nombre)]
+        return [_nombre_salida_frames(args)]
     if args.video is not None:
         if not args.video.is_file():
             raise SystemExit(f"No existe el vídeo {args.video}")
@@ -535,6 +594,8 @@ def cargar_detectores(args):
         conf=args.conf_pose,
         imgsz=args.imgsz,
         conf_mano=config_manos.min_confidence,
+        anclar_persona=not getattr(args, "sin_ancla_persona", False),
+        ancla_distancia=float(getattr(args, "ancla_distancia", 140.0) or 140.0),
     )
     detector = DetectorUltralytics(
         modelo=str(args.modelo_objeto),
@@ -739,8 +800,16 @@ def candidatos_en_munecas(frame, contexto, detector, sam, args) -> list[Instanci
     area_max = max(float(area_max), 1800.0)
     candidatos: list[Instancia] = []
     umbral_mano = float(getattr(contexto, "conf_dibujo", 0.20) or 0.20)
+    umbral_dedos = float(
+        getattr(getattr(args, "config_manos", None), "min_hand_confidence", 0.30) or 0.30
+    )
     for mano in contexto.manos:
         if float(mano.confianza) < umbral_mano:
+            continue
+        # Dedos (no muñecas): sin palma de Hands o score < 0.3 no se lanza SAM.
+        if getattr(args, "mediapipe", False) and float(
+            getattr(mano, "confianza_dedos", 0.0) or 0.0
+        ) < umbral_dedos:
             continue
         # Palma abierta que cuelga al costado: no hay artículo. En el torso
         # (puño que vuelve de la estantería) sí se busca.
@@ -785,6 +854,8 @@ def candidatos_en_munecas(frame, contexto, detector, sam, args) -> list[Instanci
             if not _forma_de_objeto(inst, args):
                 continue
             if _parece_brazo_o_suelo(inst, contexto):
+                continue
+            if _mascara_es_antebrazo(inst, mano, contexto):
                 continue
             if mascara_es_la_mano(inst, mano) and not lejos:
                 continue
@@ -1518,6 +1589,16 @@ def seguir_contenedores(frames, detector, cada: int, iou_min: float = 0.3,
                 )
                 if det.get("lado") and pista.get("lado") and det["lado"] != pista["lado"]:
                     continue
+                if det["categoria"] == "celular":
+                    ca, cb = _centro_caja(det["caja"]), _centro_caja(pista["caja"])
+                    if float(np.hypot(ca[0] - cb[0], ca[1] - cb[1])) > 90.0:
+                        continue
+                    lado_det = _lado_cerca_mano(det["caja"], contexto)
+                    lado_prev = _lado_cerca_mano(
+                        pista["caja"], _contexto_en(contextos, pista["ultimo_frame"])
+                    )
+                    if lado_det and lado_prev and lado_det != lado_prev:
+                        continue
                 if indice == pista["ultimo_frame"]:
                     if accesorio and _cajas_cercanas(
                         det["caja"], pista["cajas"].get(indice, pista["caja"])
@@ -1929,6 +2010,7 @@ def _anclar_celular_a_mano(pistas: list[dict], contextos) -> list[dict]:
         w = float(np.median([m[0] for m in medidas]))
         h = float(np.median([m[1] for m in medidas]))
         primer, ultimo = min(cajas), max(cajas)
+        ultima_caja = cajas[max(cajas)]
         for i in range(max(0, primer - 2), min(len(contextos), ultimo + 12)):
             if i in cajas:
                 continue
@@ -1945,7 +2027,12 @@ def _anclar_celular_a_mano(pistas: list[dict], contextos) -> list[dict]:
                 continue
             if not _mano_cerca_caja(mano, nueva, margen=36.0):
                 continue
+            prev = _centro_caja(ultima_caja)
+            ahora = _centro_caja(nueva)
+            if float(np.hypot(prev[0] - ahora[0], prev[1] - ahora[1])) > 110.0:
+                continue
             cajas[i] = nueva
+            ultima_caja = nueva
         if cajas:
             uf = max(cajas)
             pista["ultimo_frame"] = uf
@@ -2292,6 +2379,46 @@ def _cubre_torso(inst: Instancia, contexto) -> bool:
     area_t = _area_caja(torso)
     if area_t > 0 and _area_caja(inst.caja) >= 0.50 * area_t:
         return True
+    return False
+
+
+def _mascara_es_antebrazo(inst: Instancia, mano, contexto) -> bool:
+    """True si SAM/YOLO segmentó la manga o el antebrazo, no un artículo en la palma."""
+    if inst is None or mano is None or inst.mascara is None:
+        return False
+    palma = mano.palma or mano.punto
+    cx, cy = float(inst.centro[0]), float(inst.centro[1])
+    dx, dy = getattr(mano, "direccion", (0.0, 1.0)) or (0.0, 1.0)
+    norma = float(np.hypot(dx, dy)) or 1.0
+    dx, dy = dx / norma, dy / norma
+    # Hacia el codo (opuesto a palma←muñeca): es el brazo, no el objeto.
+    if (cx - float(palma[0])) * dx + (cy - float(palma[1])) * dy < -4.0:
+        return True
+    if contexto is None or not getattr(contexto, "personas", None):
+        return False
+    persona = max(contexto.personas, key=lambda p: p.altura)
+    kp = persona.keypoints
+    if kp is None or len(kp) <= 10:
+        return False
+    mascara = inst.mascara
+    alto_m, ancho_m = mascara.shape[:2]
+    for muneca, codo in ((MUNECA_IZQ, CODO_IZQ), (MUNECA_DER, CODO_DER)):
+        if float(kp[muneca][2]) < 0.15 or float(kp[codo][2]) < 0.15:
+            continue
+        wx, wy = float(kp[muneca][0]), float(kp[muneca][1])
+        ex, ey = float(kp[codo][0]), float(kp[codo][1])
+        largo = float(np.hypot(wx - ex, wy - ey))
+        if largo < 22.0:
+            continue
+        hits = 0
+        n = 10
+        for t in np.linspace(0.12, 0.92, n):
+            xi = int(round(ex + t * (wx - ex)))
+            yi = int(round(ey + t * (wy - ey)))
+            if 0 <= yi < alto_m and 0 <= xi < ancho_m and mascara[yi, xi]:
+                hits += 1
+        if hits / n >= 0.40:
+            return True
     return False
 
 
@@ -2987,6 +3114,8 @@ def objetos_del_frame(frame, contexto, detector, sam, args) -> list[tuple[Instan
 
 def detectar_objetos(frames, escena, detector, sam, args):
     """Recorre el vídeo y agrupa en pistas los objetos vistos en las manos."""
+    if hasattr(escena, "reset_ancla"):
+        escena.reset_ancla()
     contextos: list = []
     pistas: list[dict] = []
     total = 0
@@ -2998,6 +3127,10 @@ def detectar_objetos(frames, escena, detector, sam, args):
             alto, ancho = frame.shape[:2]
             contexto = ContextoEscena(ancho=ancho, alto=alto)
         contextos.append(contexto)
+        n_det = int(getattr(contexto, "n_personas_detectadas", len(contexto.personas) if contexto.personas else 0) or 0)
+        if n_det > 1 and indice % 10 == 0:
+            metodo = getattr(contexto, "ancla_metodo", None) or "—"
+            print(f"    frame {indice}: YOLO {n_det} personas → ancla {metodo} ({len(contexto.personas)} sujeta)")
         if getattr(contexto, "personas", None) and _de_espaldas(contexto):
             contexto.manos = []
         if not contexto.manos:
@@ -3027,7 +3160,25 @@ def detectar_objetos(frames, escena, detector, sam, args):
             mano_nueva = agarre["mano"]
             if mejor is not None and mejor_d <= args.distancia_max:
                 mano_prev = (mejor["agarres"].get(mejor["ultimo_frame"]) or {}).get("mano")
-                cambio_lejano = (
+                hueco_pista = indice - int(mejor["ultimo_frame"])
+                scores_lado = agarre.get("scores") or {}
+                traspaso = (
+                    mano_nueva == "ambas"
+                    or mano_prev == "ambas"
+                    or (
+                        float(scores_lado.get("izquierda", 0) or 0) >= 0.35
+                        and float(scores_lado.get("derecha", 0) or 0) >= 0.35
+                    )
+                )
+                # Un frame no da para un traspaso L↔R: es un error de lado.
+                cambio_lado_imposible = (
+                    hueco_pista <= 2
+                    and mano_prev in ("izquierda", "derecha")
+                    and mano_nueva in ("izquierda", "derecha")
+                    and mano_prev != mano_nueva
+                    and not traspaso
+                )
+                cambio_lejano = cambio_lado_imposible or (
                     mano_prev in ("izquierda", "derecha")
                     and mano_nueva in ("izquierda", "derecha")
                     and mano_prev != mano_nueva
@@ -3049,6 +3200,7 @@ def detectar_objetos(frames, escena, detector, sam, args):
                 salto_vertical = dy > (220.0 if (mano_prev and mano_nueva) else 140.0)
             else:
                 cambio_lejano = False
+                cambio_lado_imposible = False
                 salto_area = False
                 salto_vertical = False
             if (
@@ -3709,6 +3861,24 @@ def _mano_cerca_caja(mano, caja, margen: float = 48.0) -> bool:
     return _dentro_de_caja(palma, caja, margen=margen) or _dentro_de_caja(mano.punto, caja, margen=margen)
 
 
+def _lado_cerca_mano(caja, contexto, margen: float = 48.0) -> str | None:
+    """Lado de la palma más cercana a la caja, o None si no hay contacto."""
+    if caja is None or contexto is None or not getattr(contexto, "manos", None):
+        return None
+    mejor, mejor_d = None, 1e9
+    cc = _centro_caja(caja)
+    for mano in contexto.manos:
+        if mano.lado not in ("izquierda", "derecha"):
+            continue
+        if not _mano_cerca_caja(mano, caja, margen=margen):
+            continue
+        palma = mano.palma or mano.punto
+        dist = float(np.hypot(float(palma[0]) - cc[0], float(palma[1]) - cc[1]))
+        if dist < mejor_d:
+            mejor, mejor_d = mano.lado, dist
+    return mejor
+
+
 def _mascara_de_caja(alto: int, ancho: int, caja) -> np.ndarray:
     mascara = np.zeros((alto, ancho), dtype=bool)
     if caja is None:
@@ -3891,10 +4061,16 @@ def fusionar_objetos(objetos: list[Objeto], comunes_min: int = 1, solape_min: fl
         if salto > 12:
             return False
         hip_a, hip_b = _hip_de_vista(va), _hip_de_vista(vb)
-        if (
+        lados_opuestos = (
             va.mano in ("izquierda", "derecha")
             and vb.mano in ("izquierda", "derecha")
             and va.mano != vb.mano
+        )
+        # Un hueco de 1–2 frames no es un traspaso: son dos identificaciones distintas.
+        if lados_opuestos and salto <= 2:
+            return False
+        if (
+            lados_opuestos
             and hip_a is not None
             and hip_b is not None
             and hip_a != hip_b
@@ -3923,10 +4099,19 @@ def fusionar_objetos(objetos: list[Objeto], comunes_min: int = 1, solape_min: fl
                         if {"izquierda", "derecha"} <= manos or "ambas" in manos:
                             ya.vistas[frame] = replace(prev, mano="ambas")
                     else:
+                        vecinos = [f for f in ya.vistas if abs(int(f) - int(frame)) <= 2]
+                        if (
+                            vista.mano in ("izquierda", "derecha")
+                            and any(
+                                ya.vistas[f].mano in ("izquierda", "derecha")
+                                and ya.vistas[f].mano != vista.mano
+                                for f in vecinos
+                            )
+                        ):
+                            continue
                         if ya.vistas and int(frame) > int(max(ya.vistas)):
                             ya.vistas[frame] = vista
                         else:
-                            vecinos = [f for f in ya.vistas if abs(int(f) - int(frame)) <= 2]
                             if vecinos:
                                 dmin = min(
                                     float(np.hypot(
@@ -3947,11 +4132,47 @@ def fusionar_objetos(objetos: list[Objeto], comunes_min: int = 1, solape_min: fl
     supervivientes.sort(key=lambda o: min(o.vistas) if o.vistas else 0)
     for numero, objeto in enumerate(supervivientes, start=1):
         objeto.id = numero
+        _estabilizar_manos_objeto(objeto)
     return supervivientes
+
+
+def _estabilizar_lado_mano(mano, mano_prev, scores, hueco: int):
+    """En 1–2 frames no se permite L↔R salvo que las dos palmas puntúen (traspaso)."""
+    if mano == "ambas" or mano_prev in (None, "ambas"):
+        return mano
+    if hueco > 2:
+        return mano
+    if (
+        mano_prev in ("izquierda", "derecha")
+        and mano in ("izquierda", "derecha")
+        and mano != mano_prev
+    ):
+        scores = scores or {}
+        s_prev = float(scores.get(mano_prev, 0) or 0)
+        s_new = float(scores.get(mano, 0) or 0)
+        if s_prev >= 0.32 and s_new >= 0.32:
+            return "ambas"
+        return mano_prev
+    return mano
+
+
+def _estabilizar_manos_objeto(objeto: Objeto) -> None:
+    prev_mano, prev_f = None, None
+    for f in sorted(objeto.vistas):
+        v = objeto.vistas[f]
+        hueco = 99 if prev_f is None else int(f) - int(prev_f)
+        nuevo = _estabilizar_lado_mano(v.mano, prev_mano, v.scores, hueco)
+        if nuevo != v.mano:
+            objeto.vistas[f] = replace(v, mano=nuevo)
+        if nuevo in ("izquierda", "derecha"):
+            prev_mano, prev_f = nuevo, f
+        elif nuevo == "ambas":
+            prev_f = f
 
 
 def trazar(objeto: Objeto, contextos, pista: dict, args) -> None:
     """Rellena la traza por frame: caja, centro, área y mano que lo sostiene."""
+    mano_prev, prev_idx = None, None
     for idx in sorted(objeto.mascaras):
         if idx < 0 or idx >= len(contextos):
             continue
@@ -3960,17 +4181,23 @@ def trazar(objeto: Objeto, contextos, pista: dict, args) -> None:
         if caja is None:
             continue
         agarre = puntuar_manos(mascara, caja, contextos[idx], args)
+        hueco = 99 if prev_idx is None else int(idx) - int(prev_idx)
+        mano = _estabilizar_lado_mano(agarre["mano"], mano_prev, agarre.get("scores"), hueco)
         ys, xs = np.nonzero(mascara)
         objeto.vistas[idx] = Vista(
             frame=idx,
             caja=caja,
             centro=(float(xs.mean()), float(ys.mean())),
             area=int(mascara.sum()),
-            mano=agarre["mano"],
+            mano=mano,
             score=round(agarre["score"], 4),
             scores=agarre["scores"],
             origen="deteccion" if idx in pista["mascaras"] else "propagacion",
         )
+        if mano in ("izquierda", "derecha"):
+            mano_prev, prev_idx = mano, idx
+        elif mano == "ambas":
+            prev_idx = idx
 
 
 def _registrar_mascara(objeto: Objeto, indice: int, mascara, contextos, args,
@@ -5023,8 +5250,15 @@ def anadir_argumentos_comunes(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--videos", type=Path, default=Path("videos"), help="Carpeta de vídeos.")
     parser.add_argument(
         "--video", type=Path, default=None,
-        help="Un único mp4 (opcional si args.frames / frames= es una list[np.ndarray]). "
-             "Con arrays en memoria solo nombra la carpeta de salida.",
+        help="Un único mp4 (opcional si hay --carpeta-frames o args.frames). "
+             "Con arrays o carpeta de JPEG solo nombra la carpeta de salida.",
+    )
+    parser.add_argument(
+        "--carpeta-frames", type=Path, default=None, dest="carpeta_frames",
+        help="Carpeta de JPEG/PNG (p. ej. videos/6_clip_r9_frames). "
+             "Sustituye al mp4: se procesan todas las imágenes. "
+             "Hace falta --fps entero (reloj de t=origen/fps, no muestreo). "
+             "El número del nombre (frame_000.jpg → 0) es el índice de origen.",
     )
     parser.add_argument("--salida", type=Path, default=Path("salidas"))
     parser.add_argument(
@@ -5100,10 +5334,25 @@ def anadir_argumentos_comunes(parser: argparse.ArgumentParser) -> None:
         "--fps", type=parsear_fps, default=None,
         help="Entero ≥ 1, o half/third. Con mp4: frames a procesar por cada segundo "
              "de vídeo (a 12 fps, --fps half ≡ 6 y --fps third ≡ 4; a 15 fps, "
-             "--fps 3 toma 1, 6 y 11). Con --frames: fps entero de la línea "
-             "temporal (obligatorio). Si se omite en mp4, se procesa frame a frame.",
+             "--fps 3 toma 1, 6 y 11). Con --carpeta-frames / --frames: fps entero "
+             "de la línea temporal (obligatorio). Si se omite en mp4, se procesa "
+             "frame a frame.",
     )
     parser.add_argument("--max-frames", type=int, default=None)
+    parser.add_argument(
+        "--sin-ancla-persona", action="store_true",
+        help="No anclar a un único sujeto: SAM corre en todas las personas del frame.",
+    )
+    parser.add_argument(
+        "--ancla-distancia", type=float, default=140.0,
+        help="Distancia máxima (px) entre muñecas para reidentificar al sujeto "
+             "de la sesión (C2_SAM3_WRIST_MATCH_MAX_PX).",
+    )
+    parser.add_argument(
+        "--summary", action="store_true",
+        help="tracking.json compacto: cabecera, eventos, last_roi y contenedor final. "
+             "Sin timeline por frame, sin rois de identificador y sin frames_origin.",
+    )
 
 
 def _objeto_es_celular(objeto: Objeto, contenedores) -> bool:
@@ -5325,6 +5574,35 @@ def seguir_por_deteccion(frames, pistas, contextos, args) -> list[Objeto]:
     return objetos_desde_pistas(pistas, contextos, args)
 
 
+def _traza_resumida(traza: dict) -> dict:
+    """Quita la línea temporal por frame; deja ROI final, eventos y estado."""
+    out = dict(traza)
+    out["summary"] = True
+    params = dict(out.get("parameters") or {})
+    origen = params.get("frames_origin")
+    if isinstance(origen, list):
+        params["frames_origin_count"] = len(origen)
+        params["frames_origin"] = None
+    out["parameters"] = params
+    muestreo = dict(out.get("sampling") or {})
+    idxs = muestreo.get("source_indices")
+    if isinstance(idxs, list):
+        muestreo["source_index_count"] = len(idxs)
+        if idxs:
+            muestreo["source_index_span"] = [idxs[0], idxs[-1]]
+        muestreo["source_indices"] = None
+    out["sampling"] = muestreo
+    out["containers"] = [
+        {k: v for k, v in c.items() if k != "rois"}
+        for c in (out.get("containers") or [])
+    ]
+    out["objects"] = [
+        {k: v for k, v in o.items() if k != "timeline"}
+        for o in (out.get("objects") or [])
+    ]
+    return out
+
+
 def escribir_salidas(
     video: Path,
     args,
@@ -5400,7 +5678,10 @@ def escribir_salidas(
             "container_factor": args.factor_contenedor,
             "identifiers_yaml": str(args.identificadores),
             "hand_min_confidence": getattr(getattr(args, "config_manos", None), "min_confidence", None),
+            "min_hand_confidence": getattr(getattr(args, "config_manos", None), "min_hand_confidence", None),
             "mediapipe": bool(getattr(args, "mediapipe", False)),
+            "session_person_anchor": not bool(getattr(args, "sin_ancla_persona", False)),
+            "anchor_distance_px": float(getattr(args, "ancla_distancia", 140.0) or 140.0),
             "fps": int(fps) if extra.get("input") == "frames" else args.fps,
             "width": int(ancho),
             "height": int(alto),
@@ -5444,6 +5725,8 @@ def escribir_salidas(
         for clave, valor in extra.items():
             if clave not in traza or traza[clave] is None:
                 traza[clave] = valor
+    if getattr(args, "summary", False):
+        traza = _traza_resumida(traza)
     (destino / "tracking.json").write_text(
         json.dumps(traza, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
     )
@@ -5546,6 +5829,9 @@ def procesar_video(
         escena, detector, sam, det_contenedores = detectores
         with medidor.etapa("segmentacion"):
             contextos, pistas = detectar_objetos(frames_proc, escena, detector, sam, args)
+            ancla = getattr(escena, "ancla", None)
+            if ancla is not None:
+                extra.update(ancla.resumen())
             manos_visibles = any(_munecas_visibles(ctx) for ctx in contextos)
             extra["hands_visible"] = manos_visibles
             if not manos_visibles:
@@ -5650,6 +5936,14 @@ def procesar_lote(
     height: int | None = None,
 ) -> int:
     """Procesa varios clips o una lista de arrays. Un fallo no aborta el resto."""
+    carpeta = getattr(args, "carpeta_frames", None)
+    if frames is None and carpeta is not None:
+        frames, origen_auto = cargar_carpeta_frames(carpeta)
+        if frames_origin is None:
+            frames_origin = getattr(args, "frames_origin", None) or origen_auto
+        fps = _fps_linea_temporal(fps if fps is not None else getattr(args, "fps", None))
+        if getattr(args, "video", None) is None:
+            args.video = Path(Path(carpeta).name)
     if frames is not None:
         args.frames = frames
         if frames_origin is not None:

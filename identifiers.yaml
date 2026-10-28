@@ -35,6 +35,8 @@
 
 hands:
   min_confidence: 0.50
+  # MediaPipe palm/fingers (not the wrist). Below this, SAM is skipped.
+  min_hand_confidence: 0.30
 
 identifiers:
   carrito:

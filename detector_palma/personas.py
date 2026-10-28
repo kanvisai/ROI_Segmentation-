@@ -3,6 +3,9 @@
 Es el modulo que da el contexto comun a todos los backends: ROI de la persona
 con padding y puntos de mano sobre los que buscar el objeto sostenido.
 
+YOLO puede devolver N personas; AnclaPersonaSesion deja una (el sujeto de la
+sesion) antes de MediaPipe y SAM.
+
 Estrategias disponibles:
   - 'pose'      : modelo YOLO-pose. Da persona + munecas en una sola pasada.
   - 'mediapipe' : MediaPipe Pose (esqueleto) + Hands (dedos / visibilidad).
@@ -303,6 +306,7 @@ class Mano:
     conexiones: list[tuple[tuple[float, float], tuple[float, float]]] = field(default_factory=list)
     origen: str = "pose"
     abierta: bool = False
+    confianza_dedos: float = 0.0  # MediaPipe Hands; 0 si solo hay muñeca de pose
 
     def __post_init__(self) -> None:
         if self.palma is None:
@@ -328,6 +332,8 @@ class ContextoEscena:
     manos: list[Mano] = field(default_factory=list)
     ancho: int = 0
     alto: int = 0
+    n_personas_detectadas: int = 0
+    ancla_metodo: str | None = None
 
     conf_dibujo: float = 0.20
 
@@ -420,6 +426,8 @@ class AnalizadorEscena:
         conf: float = 0.25,
         imgsz: int = 640,
         conf_mano: float = 0.50,
+        anclar_persona: bool = True,
+        ancla_distancia: float = 140.0,
     ):
         self.padding_persona = padding_persona
         self.radio_mano = radio_mano
@@ -431,6 +439,7 @@ class AnalizadorEscena:
         self._holistic = None
         self._atexit_mp = False
         self._pose_prev: dict[int, dict] = {}
+        self.ancla = None
 
         if estrategia == "auto":
             estrategia = "pose"
@@ -446,6 +455,18 @@ class AnalizadorEscena:
             self._pose = YOLO(modelo_pose)
         elif estrategia != "ninguno":
             raise ValueError(f"Estrategia de manos desconocida: {estrategia}")
+
+        from .ancla_sesion import AnclaPersonaSesion, WRIST_MATCH_MAX_PX
+
+        self.ancla = AnclaPersonaSesion(
+            activo=bool(anclar_persona),
+            max_dist_px=float(ancla_distancia if ancla_distancia else WRIST_MATCH_MAX_PX),
+        )
+
+    def reset_ancla(self) -> None:
+        if self.ancla is not None:
+            self.ancla.reset()
+            self._pose_prev = {}
 
     def _inicializar_mediapipe(self) -> None:
         mp = importar_opcional("mediapipe")
@@ -481,6 +502,8 @@ class AnalizadorEscena:
         contexto = ContextoEscena(ancho=ancho, alto=alto, conf_dibujo=self.conf_mano)
         if self.estrategia == "pose":
             self._analizar_pose(frame, contexto)
+            if self.ancla is not None:
+                self.ancla.filtrar(contexto, frame)
         elif self.estrategia == "mediapipe":
             self._analizar_mediapipe(frame, contexto)
         return contexto
@@ -616,6 +639,8 @@ class AnalizadorEscena:
         plano y el esqueleto queda desfasado respecto a la persona.
         """
         self._analizar_pose(frame, contexto)
+        if self.ancla is not None:
+            self.ancla.filtrar(contexto, frame)
         if self._holistic is None or not contexto.personas:
             return
         for pid, persona in enumerate(contexto.personas):
@@ -627,10 +652,9 @@ class AnalizadorEscena:
         import cv2
         import mediapipe as mp
 
-        caja_h = expandir_caja(
-            persona.caja, max(0.65, self.padding_persona * 2.0),
-            contexto.ancho, contexto.alto,
-        )
+        multi = int(getattr(contexto, "n_personas_detectadas", 1) or 1) > 1
+        pad = 0.28 if multi else max(0.65, self.padding_persona * 2.0)
+        caja_h = expandir_caja(persona.caja, pad, contexto.ancho, contexto.alto)
         x1, y1, x2, y2 = caja_h
         x1, y1 = max(0, int(x1)), max(0, int(y1))
         x2, y2 = min(contexto.ancho, int(x2)), min(contexto.alto, int(y2))
@@ -639,7 +663,10 @@ class AnalizadorEscena:
         # Persona recortada por el borde inferior o caja tipo cabeza: hay que
         # incluir brazos y el móvil que queda fuera del bbox de YOLO.
         # Persona recortada, caja tipo cabeza, o agachada (mete algo en el cesto).
-        expandir = y2 >= contexto.alto - 12 or h < 1.55 * w or h < 0.22 * contexto.alto
+        expandir = (
+            not multi
+            and (y2 >= contexto.alto - 12 or h < 1.55 * w or h < 0.22 * contexto.alto)
+        )
         if expandir and prev and prev.get("crop"):
             px1, py1, px2, py2 = prev["crop"]
             pw, ph = max(1, px2 - px1), max(1, py2 - py1)
@@ -679,6 +706,7 @@ class AnalizadorEscena:
         pose_ok = bool(
             kp is not None
             and _esqueleto_en_caja(kp, caja_h)
+            and _esqueleto_en_caja(kp, persona.caja)
             and not _esqueleto_colapsado(kp, persona)
             and not _esqueleto_desproporcionado(
                 kp, persona, prev.get("kp") if prev else None
@@ -696,6 +724,18 @@ class AnalizadorEscena:
         mp_manos = self._manos_holistic_recorte(
             resultado, contexto, munecas, x1, y1, sx, sy, lado, pid
         )
+        if multi and mp_manos:
+            px1, py1, px2, py2 = persona.caja
+            margen = 0.22 * max(float(persona.altura), 1.0)
+
+            def _mano_del_sujeto(mano) -> bool:
+                palma = mano.palma or mano.punto
+                return (
+                    px1 - margen <= palma[0] <= px2 + margen
+                    and py1 - margen <= palma[1] <= py2 + margen
+                )
+
+            mp_manos = [m for m in mp_manos if _mano_del_sujeto(m)]
         if pose_ok:
             contexto.manos = [m for m in contexto.manos if m.persona_id != pid]
             pose_manos = self._manos_desde_keypoints(
@@ -770,6 +810,9 @@ class AnalizadorEscena:
         scores = [_lm_score(lm) for lm in lms]
         if max(scores) < self.conf_mano and confianza < self.conf_mano:
             return None
+        # Confianza de la palma/dedos (landmarks 1–20), no de la muñeca (0).
+        scores_dedos = scores[1:] if len(scores) > 1 else scores
+        conf_dedos = float(np.mean(scores_dedos)) if scores_dedos else 0.0
         span = float(np.max(puntos.max(axis=0) - puntos.min(axis=0)))
         radio = max(24.0, span * 1.15)
         yemas = [
@@ -802,6 +845,7 @@ class AnalizadorEscena:
             conexiones=conexiones,
             origen="mediapipe",
             abierta=_mano_abierta_landmarks(puntos),
+            confianza_dedos=conf_dedos,
         )
 
     def cerrar(self) -> None:

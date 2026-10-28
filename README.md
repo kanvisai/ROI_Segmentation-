@@ -39,12 +39,12 @@ from pipeline_manos import (
 
 ## Qué hace el sistema
 
-1. Localiza **una** persona (la de mayor altura) y sus muñecas con **YOLO26n-pose** o, con `--mediapipe`, MediaPipe Holistic sobre el recorte de persona. No hay seguimiento multi-persona.
+1. Localiza personas con **YOLO26n-pose** y **ancla al sujeto de la sesión** (alcance a la balda + tamaño). En el resto de frames se le sigue por IoU / muñecas / color; las demás detecciones no entran a SAM. MediaPipe Holistic, con `--mediapipe`, solo corre en ese recorte. Si se pierde el sujeto, ese frame queda vacío (no se salta a un transeúnte). `--sin-ancla-persona` desactiva el filtro.
 2. Recorta una ventana alrededor de cada palma (`--padding-muneca`, `--crop-min`). Si el brazo alcanza una estantería (palma fuera del bbox), el recorte se aprieta para no comerse la balda.
 3. Dentro de ese recorte busca el objeto (YOLO26n-seg + MobileSAM opcional). No se busca en una palma abierta que cuelga al costado. Un puño que vuelve al torso sí se busca.
 4. Puntúa agarre contra las dos manos (`izquierda` / `derecha` / `ambas`). Dos recortes de la misma pieza se fusionan en un solo objeto. Un bulto de ropa en la cadera **no** se fusiona con un agarre posterior de la otra mano.
 5. Detecta identificadores de escena en el **frame completo** según `identifiers.yaml` (YOLO cerrado + YOLOE open-vocab). El bolsillo no sale de YOLO: se sintetiza con las caderas de la pose (`body: true`).
-6. El backend **sigue o redetecta** la máscara del objeto. Si las muñecas no superan `hands.min_confidence` (0.50 en el YAML), ese frame no ejecuta el modelo de objeto.
+6. El backend **sigue o redetecta** la máscara del objeto. Si las muñecas no superan `hands.min_confidence` (0.50) o, con `--mediapipe`, los **dedos** no llegan a `hands.min_hand_confidence` (0.30), esa palma no ejecuta SAM. Un salto L↔R entre frames consecutivos no se asocia al mismo objeto.
 7. El último frame visible decide el depósito y el `final_state` (ver [Estado final](#estado-final-del-objeto)). Mueble primero; bolsillo solo con gesto; bolso/mochila no son destino de reserva.
 8. Escribe vídeo anotado, `tracking.json`, `summary.txt`, `metrics.json` y una fila en la comparativa. Si nunca hay muñecas, `final_state` es `no_hands`. Un clip que falle no aborta el lote (`procesar_lote`).
 
@@ -106,7 +106,7 @@ cargar_detectores(args)
         |
         v
 detectar_objetos()  → contextos por frame + pistas (máscaras semilla)
-  # palma vacía / ropa en cadera / balda en el recorte se tiran aquí
+  # AnalizadorEscena ancla 1 persona; palma vacía / ropa / balda se tiran aquí
 seguir(...) o seguir_por_deteccion()  → list[Objeto]   # lo único que cambia el backend
 seguir_contenedores()                 # YOLO/YOLOE + bolsillo de pose; cose/ancla accesorios
 recortar saltos a bolsa o cadera / sembrar celular junto a la palma
@@ -270,6 +270,7 @@ source .venv/bin/activate
 hf auth login   # solo si se va a descargar facebook/sam3.1
 python sam3_mano_objeto.py --videos videos --identificadores identifiers.yaml --mediapipe --fps 3 --salida salidas
 python sam3_mano_objeto.py --video videos/6_clip_2.mp4 --identificadores identifiers.yaml --mediapipe --fps 3 --salida salidas
+python sam3_mano_objeto.py --video videos/multi_pers_clip_1.mp4 --identificadores identificadores.yaml --mediapipe --fps 3 --salida salidas
 ```
 
 Extra CLI: `--version {sam3.1,sam3}`, `--lote`. Salida: `salidas/sam3/<clip>/`. Fila: `SAM 3`.
@@ -326,19 +327,23 @@ Todos salvo VISOR llaman a `anadir_argumentos_comunes`. VISOR replica `--videos`
 | Flag | Default | Significado |
 |---|---|---|
 | `--videos` | `videos` | Carpeta de clips. |
-| `--video` | ninguno | Un solo mp4 (opcional si hay `frames`). Con arrays solo nombra la carpeta de salida. Si se pasa varias veces, argparse se queda con el **último**. |
+| `--video` | ninguno | Un solo mp4 (opcional si hay `--carpeta-frames` o `frames`). Con arrays o carpeta de JPEG solo nombra la carpeta de salida. Si se pasa varias veces, argparse se queda con el **último**. |
+| `--carpeta-frames` | ninguno | Carpeta de JPEG/PNG. Sustituye al mp4 (todas las imágenes, sin muestreo). Hace falta `--fps` entero. El número del nombre (`frame_000.jpg` → 0) es el índice de origen. Lo usan SAM 3, YOLO26, Cutie, Track-Anything y HOIST. |
 | `--frames` | ninguno | **API Python**, no flag de shell: `list[np.ndarray]` BGR (`args.frames` o `frames=`). Si está definida, el mp4 no hace falta. |
 | `--frames-origin` | `0…N-1` | `list[int]`: índice de origen de cada array. Misma longitud que `--frames`. |
 | `--width` / `--height` | se infieren del array | Enteros ≥ 1. Con arrays son el tamaño; si se pasan deben coincidir. Con mp4, si se pasan deben coincidir con el archivo. |
 | `--salida` | `salidas` | Raíz de resultados. |
 | `--identificadores` | `identifiers.yaml` | Catálogo de escena + `hands.min_confidence`. |
 | `--mediapipe` | off | MediaPipe Holistic (pose + manos) en el recorte de persona, en lugar de YOLO-pose. Rechaza mejor la mano vacía. El umbral de muñecas es `hands.min_confidence` (0.50). |
-| `--fps N\|half\|third` | omitido = frame a frame (solo mp4) | Entero, `half` o `third`. Con mp4: muestreo (`half`/`third` = la mitad o un tercio del fps del archivo). Con `--frames`: fps entero de la línea temporal (**obligatorio**). Ver [Muestreo `--fps`](#muestreo---fps). |
+| `--fps N\|half\|third` | omitido = frame a frame (solo mp4) | Entero, `half` o `third`. Con mp4: muestreo (`half`/`third` = la mitad o un tercio del fps del archivo). Con `--carpeta-frames` / `--frames`: fps entero de la línea temporal (**obligatorio**). Ver [Muestreo `--fps`](#muestreo---fps). |
 | `--max-frames` | ninguno | Corta la lectura del vídeo de origen (antes del muestreo). No aplica a arrays en memoria. |
 | `--sin-sam` | off | No usa MobileSAM. |
 | `--sin-contenedores` | off | Ignora el YAML. |
 | `--sin-frames` | off | No vuelca JPEG sueltos. |
 | `--sin-pose` | off | No pinta el esqueleto (cintura, brazos, muñecas, palmas; sin piernas ni textos). |
+| `--sin-ancla-persona` | off | SAM en todas las personas del frame. Por defecto se sigue a un único sujeto. |
+| `--ancla-distancia` | `140` | Distancia máxima (px) entre muñecas para reidentificar al sujeto (`C2_SAM3_WRIST_MATCH_MAX_PX`). |
+| `--summary` | off | `tracking.json` compacto: cabecera, eventos, `last_roi` y contenedor final. Sin `timeline[]`, sin `containers[].rois` y sin `frames_origin`. `summary.txt` no cambia. |
 
 ### Detección de palma
 
@@ -386,7 +391,7 @@ Prueba corta recomendada:
 | Entrada | `--fps N` / `half` / `third` | Si se omite |
 |---|---|---|
 | mp4 | **N frames por cada segundo de vídeo**, no un stride uniforme. `half` = `round(fps)/2`, `third` = `round(fps)/3` (un vídeo a 12 fps: `half` ≡ 6, `third` ≡ 4) | Frame a frame |
-| `list[np.ndarray]` | Fps **entero** de la **línea temporal** (obligatorio). No se vuelve a muestrear | Error |
+| `--carpeta-frames` / `list[np.ndarray]` | Fps **entero** de la **línea temporal** (obligatorio). No se vuelve a muestrear. `half`/`third` no valen | Error |
 
 ### mp4
 
@@ -406,9 +411,21 @@ El seguimiento interno usa índices 0…M−1 de los frames **procesados**. JSON
 
 `--max-frames` limita frames de **origen** leídos, y después se aplica el muestreo.
 
+### Carpeta de JPEG (`--carpeta-frames`)
+
+Sustituye al mp4 en SAM 3, YOLO26-seg, Cutie, Track-Anything y HOIST. Se leen todos los `.jpg`/`.jpeg`/`.png` de la carpeta (no se vuelve a muestrear). `--fps` es el reloj `t = origen / fps` (entero; `half`/`third` no valen). El número del nombre es el índice de origen (`frame_012.jpg` → 12). `--video` es opcional y solo nombra `salidas/<tecnologia>/<stem>/`.
+
+```bash
+.venv/bin/python sam3_mano_objeto.py \
+  --carpeta-frames videos/6_clip_r9_frames \
+  --identificadores identificadores.yaml \
+  --mediapipe --fps 12 \
+  --salida salidas
+```
+
 ### Arrays en memoria (`--frames`)
 
-No se puede pasar `list[np.ndarray]` por la shell. En Python:
+No se puede pasar `list[np.ndarray]` por la shell (usa `--carpeta-frames` si los JPEG ya están en disco). En Python:
 
 ```python
 from pipeline_manos import (
@@ -462,6 +479,7 @@ Detección inmediata en el **frame completo**. Los campos del YAML van en inglé
 ```yaml
 hands:
   min_confidence: 0.50
+  min_hand_confidence: 0.30
 
 identifiers:
   celular:
@@ -484,7 +502,8 @@ identifiers:
 | `destination` | El objeto en la mano **puede** acabar dentro de este ROI (verde). |
 | `accessory` | Bolso/mochila: se sigue sobre la persona, no se fusiona con el objeto agarrado y **no** es destino de reserva. |
 | `body` | ROI a partir de la pose (bolsillo en cadera/muslo). No se detecta con YOLO. |
-| `hands.min_confidence` | Por debajo, esa muñeca no se busca. Si no hay ninguna, `final_state` es `no_hands`. |
+| `hands.min_confidence` | Por debajo, esa **muñeca** no se busca. Si no hay ninguna, `final_state` es `no_hands`. |
+| `hands.min_hand_confidence` | Con `--mediapipe`: confianza de **palma/dedos** (no la muñeca). Por debajo de 0.30 no se lanza SAM en esa mano. |
 
 Ids Ultralytics COCO (contiguos 0–79), no los ids “paper” de COCO: `24` backpack, `26` handbag, `66` **keyboard**, `67` **cell phone**. El móvil es **67**. Carrito, cesto y bolsa no están en COCO: solo YOLOE.
 
@@ -494,12 +513,37 @@ Filtros extra (no son flags): se tiran móviles débiles o que no están junto a
 
 ---
 
+## Persona de la sesión (varias personas en el frame)
+
+SAM 3 y el resto del pipeline común no deben segmentar las manos de un transeúnte. El ancla vive en `detector_palma/ancla_sesion.py` (`AnclaPersonaSesion`) y se aplica **después** de YOLO-pose y **antes** de MediaPipe / SAM, en cada `AnalizadorEscena.analizar`. Se reinicia al empezar cada clip (`detectar_objetos` → `reset_ancla`), para no mezclar sujetos entre vídeos.
+
+Sin `poses_full.npy` de C1 (este repo no exporta GuadIA), el sujeto se elige así:
+
+1. **Semilla** (primer frame con personas): gana quien **alcanza la balda** (muñeca lejos del torso) y está más cerca de la cámara (área / altura). No es “el más alto cada frame”.
+2. **Seguimiento**: IoU del bbox (≥ 0.28 bloquea; ≥ 0.12 recupera), distancia de muñecas ≤ `--ancla-distancia` (140 px) e histograma HSV del torso.
+3. **Pérdida**: si nadie encaja, `personas` y `manos` se vacían. SAM no corre sobre otra persona. Un `--fps` bajo (p. ej. 3) puede perder al sujeto unos frames; no se reasigna al transeúnte.
+
+`tracking.json` guarda `session_person_anchor` (`temporal_iou` u `off`), `seed_frame`, `frames_locked`, `frames_lost`, `max_candidates`. El overlay solo pinta el esqueleto del sujeto.
+
+Clips de prueba: `videos/multi_pers_clip_{1,2,3}.mp4` y carpetas `videos/multi_pers_clip_*_frames_chunk00N`. El contrato C1 (muñecas de `poses_full.npy`) está descrito en `SAM3_MULTI_PERSON_SESSION_ANCHOR.md`; aquí el equivalente autónomo es el tracker temporal (§6.2 de ese documento).
+
+```bash
+.venv/bin/python sam3_mano_objeto.py \
+  --carpeta-frames videos/multi_pers_clip_1_frames_chunk001 \
+  --identificadores identificadores.yaml --mediapipe --fps 12 --salida salidas
+```
+
+---
+
 ## Objeto en la mano: qué se acepta y qué se tira
 
 El recorte de muñeca es amplio a propósito (estantería, puño, traspaso). La aceptación es estricta:
 
 - **Confianza de muñeca.** `hands.min_confidence: 0.50` en el YAML. Por debajo no se lanza SAM/YOLO en esa palma. Si **ninguna** muñeca supera el umbral en todo el clip (de espaldas desde el primer frame), `final_state: no_hands` y no hay objetos.
-- **Una persona.** Se usa la de mayor altura. El seguimiento multi-persona está desactivado.
+- **Confianza de la mano (dedos).** Con `--mediapipe`, `hands.min_hand_confidence: 0.30`. Si MediaPipe Hands no ve la palma o el score medio de los landmarks 1–20 queda por debajo, no se busca objeto (la muñeca de pose sola no basta). Evita SAM sobre un esqueleto mal colocado.
+- **No es el antebrazo.** Una máscara que sigue el codo→muñeca o que cae hacia el codo (manga) se tira. No es un artículo.
+- **Sin teleport L↔R.** En frames consecutivos el mismo objeto no puede pasar de izquierda a derecha (ni al revés) salvo un traspaso real (`ambas` o las dos palmas puntúan). Un identificador `celular` tampoco salta de una mano a la otra en un frame.
+- **Una persona.** El ancla de sesión elige un sujeto y lo sigue (IoU / muñecas). No se usa “el más alto” en cada frame. `--sin-ancla-persona` lo desactiva.
 - **Palma abierta colgando** (brazo vertical junto al muslo): no se busca objeto. Un puño o una palma que **vuelve al torso** después de alcanzar la estantería sí.
 - **Ropa / muslo / puño vacío.** MediaPipe con landmarks: si la máscara es la mano, se tira. Un SAM pegado a una palma que cuelga y cuyo centro cae en la palma se trata como puño vacío, no como artículo. Un objeto real con color distinto (p. ej. un pack en el puño de perfil) se conserva.
 - **Balda en el recorte.** Si el brazo está lejos del torso, un blob más lejos de la palma que la propia palma (cartel, góndola) se rechaza o se recorta al disco de la palma.
@@ -557,13 +601,13 @@ Por clip y tecnología, en `salidas/<tecnologia>/<stem>/`:
 |---|---|
 | `anotado.mp4` | Máscaras de objeto, caja + etiqueta de mano (`L`/`R`/`BOTH`/`FREE`), ROI de identificadores, esqueleto cintura↑, HUD `frame <origen> t=…`. |
 | `frames/<video>_frame_XXXXX.jpg` | Mismo overlay; `XXXXX` es el índice original. `--sin-frames` lo omite. |
-| `tracking.json` | Traza completa (esquema abajo). Campos en inglés. |
+| `tracking.json` | Traza completa (esquema abajo). Con `--summary`: sin `timeline[]` ni `rois` por frame. Campos en inglés. |
 | `summary.txt` | Los mismos eventos en inglés, más la frase de `--fps`. |
 | `metrics.json` | `processed_frames`, `mean_fps`, `ms_per_frame`, picos RAM/VRAM, CPU, `stages`. |
 
 ### `tracking.json` (pipeline común)
 
-Cabecera: `video`, `model`, `width`, `height`, `frames`, `source_frames`, `fps`, `output_fps`, `sampling`, `pose_backend` (`yolo-pose` o `mediapipe`), `hands_visible` (bool), `final_state` (del clip), `parameters`, `identifiers_yaml`.
+Cabecera: `video`, `model`, `width`, `height`, `frames`, `source_frames`, `fps`, `output_fps`, `sampling`, `pose_backend` (`yolo-pose` o `mediapipe`), `hands_visible` (bool), `final_state` (del clip), `session_person_anchor`, `seed_frame`, `frames_locked`, `frames_lost`, `max_candidates`, `parameters`, `identifiers_yaml`.
 
 `final_state` del clip: si no hay muñecas, `no_hands`. Si hay muñecas pero ningún objeto, `no_data`. Si hay varios objetos, gana el de mayor prioridad (`inside_container` > `in_hand` > `released` > `disappeared`). `parameters.hand_min_confidence` y `parameters.mediapipe` reflejan el YAML y `--mediapipe`.
 
@@ -600,6 +644,8 @@ Con mp4, `fps` es el del archivo (float) y `parameters.fps` es el `--fps` de mue
 - `final_container`: `{id, category, roi, fraction_inside, center_inside}` o `null`
 - `events[]`: `appears`, `disappears`, `reappears`, `releases`, `regrasps`, `hand_change` (`from`/`to`)
 - `timeline[]`: `frame`, `processed_frame`, `t`, `hand`, `roi`, `center`, `area`, `grip_score`, `hand_scores`, `origin` (`detection` \| `propagation`)
+
+Con `--summary` el mismo archivo lleva `"summary": true`, omite `objects[].timeline` y `containers[].rois`, y sustituye `parameters.frames_origin` / `sampling.source_indices` por un recuento (y `source_index_span`). Siguen `events[]`, `last_roi`, `final_state` y `final_container`.
 
 `hand` en JSON es `left` / `right` / `both` / `no_hand`. En el overlay se abrevia `L` / `R` / `BOTH` / `FREE`. Izquierda y derecha son las **de la persona**.
 
@@ -641,7 +687,7 @@ procesar_video(
 
 Para varios clips, `procesar_lote(detectores, videos, args, tecnologia, backend, modelo, seguir)` llama a `procesar_video` y no aborta el resto si uno falla.
 
-Para un servicio que solo quiera ROI final + contenedor, leer `tracking.json` → `objects[i].last_roi`, `ends_in_container`, `final_container`. No hace falta el vídeo anotado (`--sin-frames`).
+Para un servicio que solo quiera ROI final + contenedor, `--summary` (y opcionalmente `--sin-frames`). Leer `tracking.json` → `objects[i].last_roi`, `ends_in_container`, `final_container`.
 
 Importar detección suelta (sin `procesar_video`):
 
@@ -669,7 +715,7 @@ contextos, pistas = detectar_objetos(frames, escena, detector, sam, args)
   --salida salidas
 ```
 
-`--fps 3` es el valor por defecto en esos clips. Usar `--fps half` o `--fps third` si el gesto es más denso (traspaso corto, depósito en cesto). Varios `--video` no se acumulan: gana el último. Para un lote, `--videos videos`.
+`--fps 3` es el valor por defecto en esos clips. Usar `--fps half` o `--fps third` si el gesto es más denso (traspaso corto, depósito en cesto). Varios `--video` no se acumulan: gana el último. Para un lote, `--videos videos`. Para una carpeta de JPEG, `--carpeta-frames videos/6_clip_r9_frames --fps 12` (sin `--video`).
 
 ---
 
@@ -678,6 +724,7 @@ contextos, pistas = detectar_objetos(frames, escena, detector, sam, args)
 - `videos/clip.mp4`: objeto en la mano izquierda y traspaso a la derecha.
 - `videos/clip_2.mp4`: misma tarea, segundo clip.
 - En el laboratorio hay series `N_clip_M.mp4` (p. ej. `3_clip_3.mp4`, `6_clip_2.mp4`) usadas en la comparativa de 43 clips, y clips `6_clip_r*.mp4` / `fp_*.mp4` de depuración (palma vacía, bolsillo, espalda, estantería).
+- `videos/multi_pers_clip_*.mp4` y `videos/multi_pers_clip_*_frames_chunk00N`: varias personas en el pasillo; el ancla debe seguir a un único sujeto.
 - `fp_agosto2026/fp_*.mp4`: clips de depuración (depósito en cesto vs bolsillo, salida de escena, accesorios lejanos).
 
 ---
@@ -688,13 +735,15 @@ contextos, pistas = detectar_objetos(frames, escena, detector, sam, args)
 - **Celular id 66.** En Ultralytics 66 es `keyboard`. Usar `name: cell phone` (id 67). El código resuelve por nombre.
 - **Móvil fantasma.** Un `celular` débil pegado al objeto de la estantería se descarta. Hace falta score alto y palma cerca.
 - **Ruido en SAM 3 / recorte grande.** El recorte de muñeca es amplio (`padding-muneca` 1.2, `crop-min` 96); la aceptación es `factor-palma` 0.85 sobre el radio de la palma (tope 88 px). Si el brazo alcanza la góndola, el recorte se reduce. No ampliar el factor sin refiltrar agarre.
-- **Objeto fantasma en la cadera (manos vacías, persona quieta).** SAM se come el pantalón o el puño. El pipeline tira palmas abiertas que cuelgan, máscaras que son la mano, bultos estáticos en la cadera (después de fusionar) y no pega ese bulto con un agarre posterior. No bajar `hands.min_confidence`: 0.50 evita buscar en muñecas dudosas.
+- **Objeto fantasma en la cadera (manos vacías, persona quieta).** SAM se come el pantalón, el puño o la manga. El pipeline tira palmas abiertas que cuelgan, máscaras que son la mano o el antebrazo, bultos estáticos en la cadera y no pega ese bulto con un agarre posterior. No bajar `hands.min_confidence` (0.50) ni `min_hand_confidence` (0.30).
+- **Celular que salta de mano en un frame.** No es un traspaso: o la pose L/R está invertida o YOLO mezcló dos detecciones. El rastreador no asocia L↔R en hueco ≤ 2 frames.
 - **SAM se come la estantería al alargar el brazo.** Un blob más lejos del torso que la palma se rechaza o se recorta al disco de la palma. El agarre real queda en la mano, no en el cartel.
 - **Objeto fusionado con bolso de hombro.** `accessory: true` en el YAML y `descartar_accesorios` en el pipeline. El ROI del bolso se ancla a la persona; una detección lejana de 1 frame se tira.
 - **Mochila lejana como destino.** Ya no. `accessory: true` no es depósito de reserva: dejar un artículo en la estantería no lo mete en una mochila al fondo del pasillo.
 - **Bolsillo vs cesto.** Agacharse al cesto no cuenta como meter la mano en el bolsillo. Gana el mueble. El ROI del bolsillo no se pinta si esa mano sostiene el objeto.
 - **Persona que sale o se da la vuelta.** Si el último evidencia sigue en la mano: `in_hand`. Bolsillo, pérdida en las palmas, ocultación en el ROI de la persona o mano a la espalda: `disappeared`, no `inside_container`. Un brazo colgando no es “a la espalda”.
 - **Muñecas nunca visibles.** De espaldas o por debajo de 0.50: `final_state: no_hands`, sin objetos. Si antes se vio objeto+manos y luego se gira **sosteniéndolo**, es `in_hand`, no `no_hands`.
+- **Varias personas / SAM en el transeúnte.** El ancla de sesión siembra un sujeto y lo sigue. Si salta de identidad, subir `--ancla-distancia` (muñecas) o revisar que el primer frame con gente sea el cliente. `--sin-ancla-persona` vuelve al comportamiento anterior (todas las detecciones).
 - **Packs de latas como cesto/bolsa.** YOLOE en el borde inferior se filtra por score, tamaño y posición.
 - **HOIST no compila.** Hace falta el truco `third_party/nvcc-wrap` o el fallback PyTorch de atención deformable.
 - **Cutie `No está el código`.** Falta el clone en `third_party/Cutie`.
