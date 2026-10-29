@@ -428,6 +428,10 @@ class AnalizadorEscena:
         conf_mano: float = 0.50,
         anclar_persona: bool = True,
         ancla_distancia: float = 140.0,
+        ancla_criterio: str = "auto",
+        ancla_indice: int | None = None,
+        ancla_punto: tuple[float, float] | None = None,
+        ancla_munecas: list | None = None,
     ):
         self.padding_persona = padding_persona
         self.radio_mano = radio_mano
@@ -461,6 +465,10 @@ class AnalizadorEscena:
         self.ancla = AnclaPersonaSesion(
             activo=bool(anclar_persona),
             max_dist_px=float(ancla_distancia if ancla_distancia else WRIST_MATCH_MAX_PX),
+            criterio=str(ancla_criterio or "auto"),
+            indice_pedido=ancla_indice,
+            punto=ancla_punto,
+            munecas_sesion=list(ancla_munecas or []),
         )
 
     def reset_ancla(self) -> None:

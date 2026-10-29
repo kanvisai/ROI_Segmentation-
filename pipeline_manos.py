@@ -571,13 +571,69 @@ def resolver_videos(args) -> list[Path]:
 # --------------------------------------------------------------------------- #
 
 
+def parsear_ancla_persona(valor):
+    """Devuelve (criterio, indice_izq_a_der, punto_xy, munecas_xy)."""
+    if valor is None or str(valor).strip() == "":
+        return "auto", None, None, []
+    bruto = str(valor).strip()
+    clave = bruto.lower()
+    alias = {
+        "auto": "auto", "alcance": "auto", "reach": "auto",
+        "izquierda": "izquierda", "left": "izquierda",
+        "derecha": "derecha", "right": "derecha",
+        "centro": "centro", "center": "centro",
+        "altura": "altura", "tallest": "altura",
+    }
+    if clave in alias:
+        return alias[clave], None, None, []
+    if clave.isdigit() or (clave.startswith("-") and clave[1:].isdigit()):
+        return "indice", int(clave), None, []
+    txt = clave.replace("punto:", "").replace("pixel:", "")
+    forzar_munecas = txt.startswith("munecas:") or txt.startswith("wrists:")
+    txt = txt.replace("munecas:", "").replace("wrists:", "")
+    if "," in txt:
+        partes = [p.strip() for p in txt.split(",")]
+        try:
+            nums = [float(p) for p in partes]
+        except ValueError:
+            nums = []
+        if len(nums) == 4:
+            return "munecas", None, None, [(nums[0], nums[1]), (nums[2], nums[3])]
+        if len(nums) == 2:
+            if forzar_munecas:
+                return "munecas", None, None, [(nums[0], nums[1])]
+            return "punto", None, (nums[0], nums[1]), []
+    raise SystemExit(
+        "--ancla-persona debe ser auto, 0/1/2, izquierda, derecha, centro, altura, "
+        "X,Y (clic) o x1,y1,x2,y2 (muñecas izquierda y derecha)"
+    )
+
+
+def guardar_preview_ancla(ancla, destino: Path) -> Path | None:
+    """Escribe ancla_candidatos.jpg con los índices 0,1,2… de izquierda a derecha."""
+    preview = getattr(ancla, "preview", None) if ancla is not None else None
+    if preview is None:
+        return None
+    destino.mkdir(parents=True, exist_ok=True)
+    ruta = destino / "ancla_candidatos.jpg"
+    cv2.imwrite(str(ruta), preview)
+    print(f"  Candidatos numerados: {ruta}")
+    n = len(getattr(ancla, "candidatos", []) or [])
+    if n > 1:
+        print(f"  Relanza con --ancla-persona N (0 = izquierda, {n - 1} = derecha).")
+    return ruta
+
+
 def cargar_detectores(args):
     """Pose para las muñecas, seg y MobileSAM para el objeto, identificadores del YAML."""
     from detector_palma.deteccion import DetectorUltralytics, GeneradorMascarasSAM
     from detector_palma.personas import AnalizadorEscena
 
     dispositivo = "cuda" if torch.cuda.is_available() else "cpu"
-    for ruta in (args.modelo_pose, args.modelo_objeto):
+    rutas = [args.modelo_pose]
+    if not getattr(args, "ancla_listar", False):
+        rutas.append(args.modelo_objeto)
+    for ruta in rutas:
         if not Path(ruta).is_file():
             raise SystemExit(f"Falta el modelo {ruta}")
     catalogo, config_manos = cargar_catalogo(args.identificadores)
@@ -585,6 +641,13 @@ def cargar_detectores(args):
     args.config_manos = config_manos
     activos = [item for item in catalogo if item.activo]
     estrategia = "mediapipe" if getattr(args, "mediapipe", False) else "pose"
+    criterio, indice_ancla, punto_ancla, munecas_ancla = parsear_ancla_persona(
+        getattr(args, "ancla_persona", "auto")
+    )
+    args.ancla_criterio = criterio
+    args.ancla_indice = indice_ancla
+    args.ancla_punto = punto_ancla
+    args.ancla_munecas = munecas_ancla
     escena = AnalizadorEscena(
         estrategia=estrategia,
         modelo_pose=str(args.modelo_pose),
@@ -594,9 +657,19 @@ def cargar_detectores(args):
         conf=args.conf_pose,
         imgsz=args.imgsz,
         conf_mano=config_manos.min_confidence,
-        anclar_persona=not getattr(args, "sin_ancla_persona", False),
+        anclar_persona=(
+            not getattr(args, "sin_ancla_persona", False)
+            or bool(getattr(args, "ancla_listar", False))
+        ),
         ancla_distancia=float(getattr(args, "ancla_distancia", 140.0) or 140.0),
+        ancla_criterio=str(getattr(args, "ancla_criterio", "auto") or "auto"),
+        ancla_indice=getattr(args, "ancla_indice", None),
+        ancla_punto=getattr(args, "ancla_punto", None),
+        ancla_munecas=getattr(args, "ancla_munecas", None) or [],
     )
+    if getattr(args, "ancla_listar", False):
+        print(f"  --ancla-listar: solo YOLO-pose en {dispositivo}, sin SAM")
+        return escena, None, None, None
     detector = DetectorUltralytics(
         modelo=str(args.modelo_objeto),
         dispositivo=dispositivo,
@@ -3131,6 +3204,9 @@ def detectar_objetos(frames, escena, detector, sam, args):
         if n_det > 1 and indice % 10 == 0:
             metodo = getattr(contexto, "ancla_metodo", None) or "—"
             print(f"    frame {indice}: YOLO {n_det} personas → ancla {metodo} ({len(contexto.personas)} sujeta)")
+        ancla = getattr(escena, "ancla", None)
+        if getattr(args, "ancla_listar", False) and ancla is not None and ancla.caja is not None:
+            break
         if getattr(contexto, "personas", None) and _de_espaldas(contexto):
             contexto.manos = []
         if not contexto.manos:
@@ -5349,6 +5425,18 @@ def anadir_argumentos_comunes(parser: argparse.ArgumentParser) -> None:
              "de la sesión (C2_SAM3_WRIST_MATCH_MAX_PX).",
     )
     parser.add_argument(
+        "--ancla-persona", default="auto", metavar="QUIEN",
+        help="Quién sembrar. auto, 0/1/2 (izquierda→derecha), izquierda, derecha, "
+             "centro, altura, X,Y (clic en la caja) o x1,y1,x2,y2 "
+             "(muñecas izq y der en el primer frame, matching C1 ≤ --ancla-distancia).",
+    )
+    parser.add_argument(
+        "--ancla-listar", action="store_true",
+        help="Solo numera a las personas del primer frame con gente "
+             "(ancla_candidatos.jpg, 0 = izquierda) y sale. "
+             "Luego relanza con --ancla-persona N.",
+    )
+    parser.add_argument(
         "--summary", action="store_true",
         help="tracking.json compacto: cabecera, eventos, last_roi y contenedor final. "
              "Sin timeline por frame, sin rois de identificador y sin frames_origin.",
@@ -5681,6 +5769,7 @@ def escribir_salidas(
             "min_hand_confidence": getattr(getattr(args, "config_manos", None), "min_hand_confidence", None),
             "mediapipe": bool(getattr(args, "mediapipe", False)),
             "session_person_anchor": not bool(getattr(args, "sin_ancla_persona", False)),
+            "anchor_person": str(getattr(args, "ancla_persona", "auto") or "auto"),
             "anchor_distance_px": float(getattr(args, "ancla_distancia", 140.0) or 140.0),
             "fps": int(fps) if extra.get("input") == "frames" else args.fps,
             "width": int(ancho),
@@ -5832,6 +5921,14 @@ def procesar_video(
             ancla = getattr(escena, "ancla", None)
             if ancla is not None:
                 extra.update(ancla.resumen())
+                guardar_preview_ancla(ancla, destino)
+            if getattr(args, "ancla_listar", False):
+                n = len(getattr(ancla, "candidatos", []) or []) if ancla is not None else 0
+                if n == 0:
+                    print("  --ancla-listar: no hubo personas en el clip.")
+                else:
+                    print("  --ancla-listar: no se lanza SAM. Elige el índice y relanza.")
+                return True
             manos_visibles = any(_munecas_visibles(ctx) for ctx in contextos)
             extra["hands_visible"] = manos_visibles
             if not manos_visibles:

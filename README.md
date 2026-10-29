@@ -342,6 +342,8 @@ Todos salvo VISOR llaman a `anadir_argumentos_comunes`. VISOR replica `--videos`
 | `--sin-frames` | off | No vuelca JPEG sueltos. |
 | `--sin-pose` | off | No pinta el esqueleto (cintura, brazos, muñecas, palmas; sin piernas ni textos). |
 | `--sin-ancla-persona` | off | SAM en todas las personas del frame. Por defecto se sigue a un único sujeto. |
+| `--ancla-persona` | `auto` | Quién sembrar: `auto`, `0`/`1`/`2`… (izquierda→derecha), `izquierda`, `derecha`, `centro`, `altura`, `X,Y` (clic) o `x1,y1,x2,y2` (muñecas izq/der, matching C1). |
+| `--ancla-listar` | off | Solo YOLO-pose: escribe `ancla_candidatos.jpg` con un número sobre cada persona y sale. Luego `--ancla-persona N`. |
 | `--ancla-distancia` | `140` | Distancia máxima (px) entre muñecas para reidentificar al sujeto (`C2_SAM3_WRIST_MATCH_MAX_PX`). |
 | `--summary` | off | `tracking.json` compacto: cabecera, eventos, `last_roi` y contenedor final. Sin `timeline[]`, sin `containers[].rois` y sin `frames_origin`. `summary.txt` no cambia. |
 
@@ -519,18 +521,29 @@ SAM 3 y el resto del pipeline común no deben segmentar las manos de un transeú
 
 Sin `poses_full.npy` de C1 (este repo no exporta GuadIA), el sujeto se elige así:
 
-1. **Semilla** (primer frame con personas): gana quien **alcanza la balda** (muñeca lejos del torso) y está más cerca de la cámara (área / altura). No es “el más alto cada frame”.
+1. **Semilla** (primer frame con personas): por defecto (`--ancla-persona auto`) gana quien **alcanza la balda** y está más cerca de la cámara. `izquierda` / `derecha` solo cubren los extremos. Con tres o más, usa el índice `0`/`1`/`2`… de izquierda a derecha, `centro`, `altura`, un clic `X,Y`, o las **muñecas** `x1,y1,x2,y2` (matching C1: YOLO a ≤ `--ancla-distancia`). `--ancla-listar` escribe `ancla_candidatos.jpg` e imprime `munecas=x,y x,y` para copiarlas.
 2. **Seguimiento**: IoU del bbox (≥ 0.28 bloquea; ≥ 0.12 recupera), distancia de muñecas ≤ `--ancla-distancia` (140 px) e histograma HSV del torso.
 3. **Pérdida**: si nadie encaja, `personas` y `manos` se vacían. SAM no corre sobre otra persona. Un `--fps` bajo (p. ej. 3) puede perder al sujeto unos frames; no se reasigna al transeúnte.
 
-`tracking.json` guarda `session_person_anchor` (`temporal_iou` u `off`), `seed_frame`, `frames_locked`, `frames_lost`, `max_candidates`. El overlay solo pinta el esqueleto del sujeto.
+`tracking.json` guarda `session_person_anchor` (`temporal_iou` u `off`), `seed_frame`, `seed_criterion`, `seed_index`, `frames_locked`, `frames_lost`, `max_candidates`. El overlay solo pinta el esqueleto del sujeto.
 
 Clips de prueba: `videos/multi_pers_clip_{1,2,3}.mp4` y carpetas `videos/multi_pers_clip_*_frames_chunk00N`. El contrato C1 (muñecas de `poses_full.npy`) está descrito en `SAM3_MULTI_PERSON_SESSION_ANCHOR.md`; aquí el equivalente autónomo es el tracker temporal (§6.2 de ese documento).
 
 ```bash
+# 1) Ver quién es 0, 1, 2… y copiar muñecas (JPEG numerado, sin SAM)
 .venv/bin/python sam3_mano_objeto.py \
   --carpeta-frames videos/multi_pers_clip_1_frames_chunk001 \
-  --identificadores identificadores.yaml --mediapipe --fps 12 --salida salidas
+  --identificadores identificadores.yaml --fps 12 --ancla-listar --salida salidas
+# 2) Seguir a la persona del medio (o la que sea: 0 izquierda, 1, 2…)
+.venv/bin/python sam3_mano_objeto.py \
+  --carpeta-frames videos/multi_pers_clip_1_frames_chunk001 \
+  --identificadores identificadores.yaml --mediapipe --fps 12 \
+  --ancla-persona 1 --salida salidas
+# 3) Una persona, sembrando con sus muñecas (izq, der) del primer frame:
+.venv/bin/python sam3_mano_objeto.py \
+  --carpeta-frames videos/6_clip_r7_frames --identificadores identificadores.yaml \
+  --mediapipe --fps 12 \
+  --ancla-persona 645.4,553.5,942.5,491.4 --salida salidas
 ```
 
 ---
@@ -743,7 +756,8 @@ contextos, pistas = detectar_objetos(frames, escena, detector, sam, args)
 - **Bolsillo vs cesto.** Agacharse al cesto no cuenta como meter la mano en el bolsillo. Gana el mueble. El ROI del bolsillo no se pinta si esa mano sostiene el objeto.
 - **Persona que sale o se da la vuelta.** Si el último evidencia sigue en la mano: `in_hand`. Bolsillo, pérdida en las palmas, ocultación en el ROI de la persona o mano a la espalda: `disappeared`, no `inside_container`. Un brazo colgando no es “a la espalda”.
 - **Muñecas nunca visibles.** De espaldas o por debajo de 0.50: `final_state: no_hands`, sin objetos. Si antes se vio objeto+manos y luego se gira **sosteniéndolo**, es `in_hand`, no `no_hands`.
-- **Varias personas / SAM en el transeúnte.** El ancla de sesión siembra un sujeto y lo sigue. Si salta de identidad, subir `--ancla-distancia` (muñecas) o revisar que el primer frame con gente sea el cliente. `--sin-ancla-persona` vuelve al comportamiento anterior (todas las detecciones).
+- **Varias personas / SAM en el transeúnte.** `izquierda`/`derecha` no bastan si hay tres o más. `--ancla-listar` numera a todas (izquierda→derecha) en `ancla_candidatos.jpg`; relanza con `--ancla-persona 0|1|2`, `X,Y` o `x1,y1,x2,y2` (muñecas). `--sin-ancla-persona` desactiva el filtro.
+- **Cruce de personas.** Si el sujeto queda tapado, el ancla no hereda el esqueleto del otro: ese frame queda vacío y se recupera cuando YOLO vuelve a ver al sujeto (no al transeúnte).
 - **Packs de latas como cesto/bolsa.** YOLOE en el borde inferior se filtra por score, tamaño y posición.
 - **HOIST no compila.** Hace falta el truco `third_party/nvcc-wrap` o el fallback PyTorch de atención deformable.
 - **Cutie `No está el código`.** Falta el clone en `third_party/Cutie`.
