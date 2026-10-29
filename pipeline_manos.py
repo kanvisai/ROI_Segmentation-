@@ -4831,6 +4831,58 @@ def eventos_de(objeto: Objeto, fps: float, args) -> list[dict]:
     return eventos
 
 
+def confianza_dentro_de_contenedor(contenedor: dict | None) -> float | None:
+    """0–1: solape del ROI, centro dentro y score del identificador."""
+    if not contenedor:
+        return None
+    frac = max(0.0, min(1.0, float(contenedor.get("fraction_inside") or 0.0)))
+    centro = 1.0 if contenedor.get("center_inside") else 0.0
+    det = max(0.0, min(1.0, float(contenedor.get("score") or 0.0)))
+    n = max(1, int(contenedor.get("frames_evaluated") or 1))
+    temporal = min(1.0, n / 5.0)
+    espacial = 0.65 * frac + 0.35 * centro
+    return round(float(np.clip(0.70 * espacial + 0.20 * det + 0.10 * temporal, 0.0, 1.0)), 4)
+
+
+def confianza_celular(pista: dict | None, contextos=None) -> float | None:
+    """0–1: score YOLO del móvil, estabilidad en el tiempo y cercanía a la mano."""
+    if not pista or pista.get("categoria") != "celular":
+        return None
+    scores = [float(s) for s in (pista.get("scores") or []) if s is not None]
+    det_max = max(0.0, min(1.0, float(pista.get("score_max") if pista.get("score_max") is not None else (max(scores) if scores else 0.0))))
+    det_med = max(0.0, min(1.0, float(pista.get("score_medio") if pista.get("score_medio") is not None else det_max)))
+    n = max(1, int(pista.get("frames_visto") or len(pista.get("cajas") or {}) or len(scores)))
+    temporal = min(1.0, n / 5.0)
+    mano = 1.0 if _celular_junto_a_mano(pista, contextos) else 0.0
+    persona = 1.0 if _celular_junto_a_persona(pista, contextos) else 0.0
+    assoc = 0.65 * mano + 0.35 * persona
+    return round(float(np.clip(0.55 * det_max + 0.20 * det_med + 0.15 * assoc + 0.10 * temporal, 0.0, 1.0)), 4)
+
+
+def _confianza_celular_de_objeto(objeto: Objeto, contenedores) -> float | None:
+    mejor = None
+    for pista in contenedores or []:
+        if pista.get("categoria") != "celular":
+            continue
+        hay = False
+        for frame, vista in objeto.vistas.items():
+            caja_c = caja_contenedor(pista, int(frame), hold=6)
+            if caja_c is None:
+                continue
+            if iou_cajas(vista.caja, caja_c) >= 0.12 or _fraccion_caja_dentro(vista.caja, caja_c) >= 0.35:
+                hay = True
+                break
+        if not hay:
+            continue
+        c = pista.get("confidence")
+        if c is None:
+            c = confianza_celular(pista)
+        if c is None:
+            continue
+        mejor = float(c) if mejor is None else max(mejor, float(c))
+    return round(mejor, 4) if mejor is not None else None
+
+
 def estado_final(objeto: Objeto, nframes: int, contenedor: dict | None, args,
                  contextos=None) -> str:
     del nframes
@@ -4971,9 +5023,9 @@ def _oculto_dentro_de_la_persona(objeto: Objeto, contextos) -> bool:
     return False
 
 
-def _final_state_video(informes: list[dict]) -> str:
+def _informe_estado_video(informes: list[dict]) -> dict | None:
     if not informes:
-        return "no_data"
+        return None
     rango = {
         "inside_container": 0,
         "in_hand": 1,
@@ -4988,7 +5040,12 @@ def _final_state_video(informes: list[dict]) -> str:
             rango.get(info.get("final_state"), 9),
             -(info.get("last_visible_frame") or 0),
         ),
-    )["final_state"]
+    )
+
+
+def _final_state_video(informes: list[dict]) -> str:
+    info = _informe_estado_video(informes)
+    return "no_data" if info is None else str(info["final_state"])
 
 
 # --------------------------------------------------------------------------- #
@@ -5214,7 +5271,12 @@ def informe_objeto(objeto: Objeto, fps: float, nframes: int, contenedores, args,
         "no_hand": manos["sin_mano"],
     }
     dominante = max(manos, key=manos.get) if vistas else None
-    return {
+    estado = estado_final(objeto, nframes, contenedor, args, contextos)
+    conf_deposito = None
+    if contenedor is not None:
+        conf_deposito = confianza_dentro_de_contenedor(contenedor)
+        contenedor["confidence"] = conf_deposito
+    informe = {
         "id": objeto.id,
         "frames_visible": len(vistas),
         "frames_in_hand": len(en_mano),
@@ -5228,17 +5290,25 @@ def informe_objeto(objeto: Objeto, fps: float, nframes: int, contenedores, args,
             [round(vistas[-1].centro[0], 2), round(vistas[-1].centro[1], 2)] if vistas else None
         ),
         "last_visible_frame": orig(vistas[-1].frame) if vistas else None,
-        "final_state": estado_final(objeto, nframes, contenedor, args, contextos),
+        "final_state": estado,
         "ends_in_container": contenedor is not None,
         "final_container": contenedor,
         "events": eventos_en,
         "timeline": linea,
     }
+    if estado == "inside_container" and conf_deposito is not None:
+        informe["inside_container_confidence"] = conf_deposito
+    conf_cel = _confianza_celular_de_objeto(objeto, contenedores)
+    if conf_cel is not None:
+        informe["cell_phone_confidence"] = conf_cel
+    return informe
 
 
 def resumen(video: Path, informes: list[dict], contenedores, nframes: int, modelo: str,
             yaml_identificadores: Path | None = None, muestreo: dict | None = None,
-            final_state: str | None = None, pose_backend: str = "yolo-pose") -> str:
+            final_state: str | None = None, pose_backend: str = "yolo-pose",
+            inside_container_confidence: float | None = None,
+            cell_phone_confidence: float | None = None) -> str:
     lineas = [
         f"Video: {video}",
         f"Processed frames: {nframes}",
@@ -5249,8 +5319,17 @@ def resumen(video: Path, informes: list[dict], contenedores, nframes: int, model
             "description",
             "--fps was not set. Processing ran frame by frame.",
         ),
-        "",
     ]
+    if final_state:
+        if final_state == "inside_container" and inside_container_confidence is not None:
+            lineas.append(
+                f"final_state: {final_state} (confidence {float(inside_container_confidence):.2f})"
+            )
+        else:
+            lineas.append(f"final_state: {final_state}")
+    if cell_phone_confidence is not None:
+        lineas.append(f"cell_phone_confidence: {float(cell_phone_confidence):.2f}")
+    lineas.append("")
     if contenedores:
         lineas.append("Scene identifiers:")
         for pista in contenedores:
@@ -5263,9 +5342,12 @@ def resumen(video: Path, informes: list[dict], contenedores, nframes: int, model
                 extra.append("body")
             sufijo = f" [{', '.join(extra)}]" if extra else ""
             roi = list(pista["caja"]) if pista.get("caja") is not None else []
+            extra_conf = ""
+            if pista.get("categoria") == "celular" and pista.get("confidence") is not None:
+                extra_conf = f", confidence {float(pista['confidence']):.2f}"
             lineas.append(
                 f"  {pista['id']}: ROI {roi}, max score {pista['score_max']:.2f}, "
-                f"seen in {pista['frames_visto']} samples{sufijo}"
+                f"seen in {pista['frames_visto']} samples{extra_conf}{sufijo}"
             )
     else:
         lineas.append("No active identifier from the YAML was detected.")
@@ -5309,7 +5391,15 @@ def resumen(video: Path, informes: list[dict], contenedores, nframes: int, model
             lineas.append("  object disappeared from the hands")
         else:
             lineas.append("  does not end inside any container")
-        lineas.append(f"  final_state: {info['final_state']}")
+        if info["final_state"] == "inside_container" and info.get("inside_container_confidence") is not None:
+            lineas.append(
+                f"  final_state: {info['final_state']} "
+                f"(confidence {info['inside_container_confidence']:.2f})"
+            )
+        else:
+            lineas.append(f"  final_state: {info['final_state']}")
+        if info.get("cell_phone_confidence") is not None:
+            lineas.append(f"  cell_phone_confidence: {info['cell_phone_confidence']:.2f}")
     lineas.append(
         "\nLeft and right are the person's hands. «both» means both hands beat the "
         "grip threshold on the same frame."
@@ -5663,9 +5753,13 @@ def seguir_por_deteccion(frames, pistas, contextos, args) -> list[Objeto]:
 
 
 def _traza_resumida(traza: dict) -> dict:
-    """Quita la línea temporal por frame; deja ROI final, eventos y estado."""
+    """Quita la línea temporal por frame; deja ROI final, eventos, estado y confianza de depósito."""
     out = dict(traza)
     out["summary"] = True
+    if traza.get("inside_container_confidence") is not None:
+        out["inside_container_confidence"] = traza["inside_container_confidence"]
+    if traza.get("cell_phone_confidence") is not None:
+        out["cell_phone_confidence"] = traza["cell_phone_confidence"]
     params = dict(out.get("parameters") or {})
     origen = params.get("frames_origin")
     if isinstance(origen, list):
@@ -5713,6 +5807,9 @@ def escribir_salidas(
 ) -> None:
     extra = extra or {}
     muestreo = extra.get("sampling") or describir_muestreo(args.fps, fps, nframes_origen, nframes)
+    for pista in contenedores:
+        if pista.get("categoria") == "celular":
+            pista["confidence"] = confianza_celular(pista, contextos)
     informes = [
         informe_objeto(o, fps, nframes, contenedores, args, indices_origen, contextos)
         for o in objetos
@@ -5738,7 +5835,19 @@ def escribir_salidas(
         return frame_origen(idx, indices_origen)
 
     if extra.get("final_state") is None:
-        extra["final_state"] = _final_state_video(informes)
+        ganador = _informe_estado_video(informes)
+        extra["final_state"] = ganador["final_state"] if ganador else "no_data"
+        if ganador and ganador.get("final_state") == "inside_container":
+            extra["inside_container_confidence"] = ganador.get("inside_container_confidence")
+    confs_cel = [
+        float(p["confidence"]) for p in contenedores
+        if p.get("categoria") == "celular" and p.get("confidence") is not None
+    ]
+    for info in informes:
+        if info.get("cell_phone_confidence") is not None:
+            confs_cel.append(float(info["cell_phone_confidence"]))
+    if confs_cel:
+        extra["cell_phone_confidence"] = round(max(confs_cel), 4)
     pose_backend = "mediapipe" if getattr(args, "mediapipe", False) else "yolo-pose"
     traza = {
         "video": str(video),
@@ -5753,6 +5862,8 @@ def escribir_salidas(
         "pose_backend": pose_backend,
         "hands_visible": extra.get("hands_visible", True),
         "final_state": extra.get("final_state"),
+        "inside_container_confidence": extra.get("inside_container_confidence"),
+        "cell_phone_confidence": extra.get("cell_phone_confidence"),
         "parameters": {
             "input": extra.get("input", "video"),
             "wrist_padding": args.padding_muneca,
@@ -5796,6 +5907,11 @@ def escribir_salidas(
                 "prompt": p["texto"],
                 "mean_score": p["score_medio"],
                 "max_score": p["score_max"],
+                **(
+                    {"confidence": p["confidence"]}
+                    if p.get("categoria") == "celular" and p.get("confidence") is not None
+                    else {}
+                ),
                 "first_frame": orig(p["primer_frame"]),
                 "last_frame": orig(p["ultimo_frame"]),
                 "frames_seen": p["frames_visto"],
@@ -5810,6 +5926,10 @@ def escribir_salidas(
         ],
         "objects": informes,
     }
+    if traza.get("inside_container_confidence") is None:
+        traza.pop("inside_container_confidence", None)
+    if traza.get("cell_phone_confidence") is None:
+        traza.pop("cell_phone_confidence", None)
     if extra:
         for clave, valor in extra.items():
             if clave not in traza or traza[clave] is None:
@@ -5822,6 +5942,8 @@ def escribir_salidas(
     texto = resumen(
         video, informes, contenedores, nframes, modelo, args.identificadores, muestreo,
         final_state=traza.get("final_state"), pose_backend=pose_backend,
+        inside_container_confidence=traza.get("inside_container_confidence"),
+        cell_phone_confidence=traza.get("cell_phone_confidence"),
     )
     (destino / "summary.txt").write_text(texto, encoding="utf-8")
     (destino / "metrics.json").write_text(
