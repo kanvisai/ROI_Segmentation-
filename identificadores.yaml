@@ -1,4 +1,5 @@
-# Scene identifiers: detected on the full frame, without waiting for a hand.
+# Identificadores: carrito/cesto/bolso/mochila en el frame completo.
+# botella y celular no van a frame completo: solo el recorte de muñeca.
 # Canonical file: identifiers.yaml. This copy keeps older --identificadores paths working.
 #
 # destination / accessory / body: same meaning as identifiers.yaml.
@@ -9,7 +10,8 @@
 # hands.min_confidence applies per hand. MediaPipe rejects empty-hand masks.
 hands:
   min_confidence: 0.50
-  # Palma/dedos de MediaPipe (no la muñeca). Por debajo no se lanza SAM.
+  # Palma/dedos de MediaPipe (no la muñeca). Palma abierta que cuelga: no SAM.
+  # Puño cerrado o alcance a la estantería: sí se busca (artículo genérico).
   min_hand_confidence: 0.30
 
 identifiers:
@@ -69,6 +71,17 @@ identifiers:
     prompts:
       - cell phone
       - mobile phone
+
+  botella:
+    active: true
+    ultralytics_id: 39
+    name: bottle
+    destination: false
+    accessory: false
+    prompts:
+      - bottle
+      - beer bottle
+      - plastic bottle
 
   bolsillo:
     active: true

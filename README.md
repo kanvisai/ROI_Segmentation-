@@ -328,7 +328,8 @@ Todos salvo VISOR llaman a `anadir_argumentos_comunes`. VISOR replica `--videos`
 |---|---|---|
 | `--videos` | `videos` | Carpeta de clips. |
 | `--video` | ninguno | Un solo mp4 (opcional si hay `--carpeta-frames` o `frames`). Con arrays o carpeta de JPEG solo nombra la carpeta de salida. Si se pasa varias veces, argparse se queda con el **último**. |
-| `--carpeta-frames` | ninguno | Carpeta de JPEG/PNG. Sustituye al mp4 (todas las imágenes, sin muestreo). Hace falta `--fps` entero. El número del nombre (`frame_000.jpg` → 0) es el índice de origen. Lo usan SAM 3, YOLO26, Cutie, Track-Anything y HOIST. |
+| `--carpeta-frames` | ninguno | Carpeta de JPEG/PNG. Sustituye al mp4 (todas las imágenes, sin muestreo). Hace falta `--fps` entero. El número del nombre (`frame_000.jpg` → 0) es el índice de origen. Si la ruta no tiene imágenes pero sí subcarpetas con JPEG (p. ej. `videos/`), se procesa cada una. Lo usan SAM 3, YOLO26, Cutie, Track-Anything y HOIST. |
+| `--subcarpetas-frames` | off | Con `--videos DIR`, procesa también cada subcarpeta que contenga JPEG/PNG (además de los mp4). Hace falta `--fps` entero para esas carpetas. |
 | `--frames` | ninguno | **API Python**, no flag de shell: `list[np.ndarray]` BGR (`args.frames` o `frames=`). Si está definida, el mp4 no hace falta. |
 | `--frames-origin` | `0…N-1` | `list[int]`: índice de origen de cada array. Misma longitud que `--frames`. |
 | `--width` / `--height` | se infieren del array | Enteros ≥ 1. Con arrays son el tamaño; si se pasan deben coincidir. Con mp4, si se pasan deben coincidir con el archivo. |
@@ -419,9 +420,21 @@ Sustituye al mp4 en SAM 3, YOLO26-seg, Cutie, Track-Anything y HOIST. Se leen to
 
 ```bash
 .venv/bin/python sam3_mano_objeto.py \
-  --carpeta-frames videos/6_clip_r9_frames \
+  --carpeta-frames videos/a_clip_r12_frames_chunk_002 \
   --identificadores identificadores.yaml \
   --mediapipe --fps 12 \
+  --salida salidas
+
+# Todas las subcarpetas de frames bajo videos/ (y también los mp4):
+.venv/bin/python sam3_mano_objeto.py \
+  --videos videos --subcarpetas-frames \
+  --identificadores identifiers.yaml --mediapipe --fps 12 \
+  --salida salidas
+
+# Solo subcarpetas de frames (sin mp4):
+.venv/bin/python sam3_mano_objeto.py \
+  --carpeta-frames videos \
+  --identificadores identifiers.yaml --mediapipe --fps 12 \
   --salida salidas
 ```
 
@@ -553,16 +566,18 @@ Clips de prueba: `videos/multi_pers_clip_{1,2,3}.mp4` y carpetas `videos/multi_p
 El recorte de muñeca es amplio a propósito (estantería, puño, traspaso). La aceptación es estricta:
 
 - **Confianza de muñeca.** `hands.min_confidence: 0.50` en el YAML. Por debajo no se lanza SAM/YOLO en esa palma. Si **ninguna** muñeca supera el umbral en todo el clip (de espaldas desde el primer frame), `final_state: no_hands` y no hay objetos.
-- **Confianza de la mano (dedos).** Con `--mediapipe`, `hands.min_hand_confidence: 0.30`. Si MediaPipe Hands no ve la palma o el score medio de los landmarks 1–20 queda por debajo, no se busca objeto (la muñeca de pose sola no basta). Evita SAM sobre un esqueleto mal colocado.
+- **Confianza de la mano (dedos).** Con `--mediapipe`, `hands.min_hand_confidence: 0.30`. Palma abierta que cuelga o score de dedos bajo junto al muslo: no se lanza SAM. Un **puño cerrado** o un brazo que alcanza la estantería sí se busca aunque Hands no puntúe los dedos (el artículo robado no tiene por qué ser un móvil).
+- **Mercancía genérica.** El recorte de palma (YOLO-seg + SAM) es el detector principal. `botella` y `celular` no se buscan ni se pintan en el frame completo (ni en JPEG ni en `anotado.mp4`): las baldas no se etiquetan. Solo cuenta lo que está en el recorte de muñeca. Un pack rectangular en la mano (caja, cartón) se acepta aunque esté junto al torso.
+- **Sin persona / sin manos.** No se lanza SAM ni YOLO de identificadores. El overlay no pinta botellas de góndola ni `phone` en el HUD.
 - **No es el antebrazo.** Una máscara que sigue el codo→muñeca o que cae hacia el codo (manga) se tira. No es un artículo.
 - **Sin teleport L↔R.** En frames consecutivos el mismo objeto no puede pasar de izquierda a derecha (ni al revés) salvo un traspaso real (`ambas` o las dos palmas puntúan). Un identificador `celular` tampoco salta de una mano a la otra en un frame.
 - **Una persona.** El ancla de sesión elige un sujeto y lo sigue (IoU / muñecas). No se usa “el más alto” en cada frame. `--sin-ancla-persona` lo desactiva.
-- **Palma abierta colgando** (brazo vertical junto al muslo): no se busca objeto. Un puño o una palma que **vuelve al torso** después de alcanzar la estantería sí.
-- **Ropa / muslo / puño vacío.** MediaPipe con landmarks: si la máscara es la mano, se tira. Un SAM pegado a una palma que cuelga y cuyo centro cae en la palma se trata como puño vacío, no como artículo. Un objeto real con color distinto (p. ej. un pack en el puño de perfil) se conserva.
+- **Palma abierta colgando** (brazo vertical junto al muslo): no se busca objeto. Un puño o una palma que **vuelve al torso** después de alcanzar la estantería sí. Un pack rectangular pegado a la palma en la cadera no se tira como ropa.
+- **Ropa / muslo / puño vacío.** Palma abierta cuya máscara es la mano: se tira. Un puño cerrado en un alcance o al volver al cuerpo se conserva (ocultación). Un SAM pegado a una palma que cuelga se trata como puño vacío, no como artículo.
 - **Balda en el recorte.** Si el brazo está lejos del torso, un blob más lejos de la palma que la propia palma (cartel, góndola) se rechaza o se recorta al disco de la palma.
 - **Bulto estático en la cadera.** Una mancha de ropa o de puño vacío que no se aleja del torso (persona quieta, manos libres) no es un agarre. Se filtra **después** de fusionar pistas, para no unir dos fantasmas cortos en uno largo. Excepción: el artículo real que acaba escondido a la espalda o dentro del ROI de la persona.
 - **No pegar cadera con agarre.** Un bulto en la cadera de una mano no se asocia ni se fusiona con un alcance posterior de la otra (o de la misma cuando el brazo sí se aleja).
-- **No arrastrar el ROI.** `extender_si_sigue_en_mano` no traduce la caja si la palma vuelve pegada al torso: evita que un fantasma de cadera crezca hasta tapar el agarre real.
+- **No arrastrar el ROI.** `extender_si_sigue_en_mano` no traduce la caja si la palma vuelve pegada al torso (evita un fantasma de cadera), salvo un pack rectangular que sigue en la misma mano.
 
 ---
 
@@ -612,8 +627,8 @@ Por clip y tecnología, en `salidas/<tecnologia>/<stem>/`:
 
 | Archivo | Contenido |
 |---|---|
-| `anotado.mp4` | Máscaras de objeto, caja + etiqueta de mano (`L`/`R`/`BOTH`/`FREE`), ROI de identificadores, esqueleto cintura↑, HUD `frame <origen> t=…`. |
-| `frames/<video>_frame_XXXXX.jpg` | Mismo overlay; `XXXXX` es el índice original. `--sin-frames` lo omite. |
+| `anotado.mp4` | Máscaras de objeto, caja + etiqueta de mano (`L`/`R`/`BOTH`/`FREE`) y score, ROI de identificadores con confianza, esqueleto cintura↑. HUD: `frame`, `t=`, objetos en mano y, si hay, `phone 0.73` / `inside 0.89`. |
+| `frames/<video>_frame_XXXXX.jpg` | Mismo overlay; `XXXXX` es el índice original. `--sin-frames` lo omite. Incluye las mismas confianzas. |
 | `tracking.json` | Traza completa (esquema abajo). Con `--summary`: sin `timeline[]` ni `rois` por frame. Campos en inglés. |
 | `summary.txt` | Los mismos eventos en inglés, más la frase de `--fps`. |
 | `metrics.json` | `processed_frames`, `mean_fps`, `ms_per_frame`, picos RAM/VRAM, CPU, `stages`. |
@@ -622,7 +637,7 @@ Por clip y tecnología, en `salidas/<tecnologia>/<stem>/`:
 
 Cabecera: `video`, `model`, `width`, `height`, `frames`, `source_frames`, `fps`, `output_fps`, `sampling`, `pose_backend` (`yolo-pose` o `mediapipe`), `hands_visible` (bool), `final_state` (del clip), `inside_container_confidence` / `cell_phone_confidence` si aplican, `session_person_anchor`, `seed_frame`, `frames_locked`, `frames_lost`, `max_candidates`, `parameters`, `identifiers_yaml`.
 
-`final_state` del clip: si no hay muñecas, `no_hands`. Si hay muñecas pero ningún objeto, `no_data`. Si hay varios objetos, gana el de mayor prioridad (`inside_container` > `in_hand` > `released` > `disappeared`). Si el clip es `inside_container`, la cabecera incluye `inside_container_confidence` (el del objeto ganador). `parameters.hand_min_confidence` y `parameters.mediapipe` reflejan el YAML y `--mediapipe`.
+`final_state` del clip: si no hay muñecas, `no_hands`. Si hay muñecas pero ningún objeto, `no_data`. Si hay varios objetos, gana el de mayor prioridad (`inside_container` > `disappeared` > `in_hand` > `released`). Un puño que sigue `in_hand` no tapa la ocultación. Si el clip es `inside_container`, la cabecera incluye `inside_container_confidence` (el del objeto ganador). `parameters.hand_min_confidence` y `parameters.mediapipe` reflejan el YAML y `--mediapipe`.
 
 Con mp4, `fps` es el del archivo (float) y `parameters.fps` es el `--fps` de muestreo (o `null`). Con arrays, `fps` y `parameters.fps` son el entero de la línea temporal; `parameters.input` es `"frames"`; `parameters.frames_origin` es la `list[int]`; `parameters.width` / `parameters.height` son enteros. `width` y `height` de la cabecera también son enteros.
 
@@ -750,7 +765,7 @@ contextos, pistas = detectar_objetos(frames, escena, detector, sam, args)
 - **Celular id 66.** En Ultralytics 66 es `keyboard`. Usar `name: cell phone` (id 67). El código resuelve por nombre.
 - **Móvil fantasma.** Un `celular` débil pegado al objeto de la estantería se descarta. Hace falta score alto y palma cerca.
 - **Ruido en SAM 3 / recorte grande.** El recorte de muñeca es amplio (`padding-muneca` 1.2, `crop-min` 96); la aceptación es `factor-palma` 0.85 sobre el radio de la palma (tope 88 px). Si el brazo alcanza la góndola, el recorte se reduce. No ampliar el factor sin refiltrar agarre.
-- **Objeto fantasma en la cadera (manos vacías, persona quieta).** SAM se come el pantalón, el puño o la manga. El pipeline tira palmas abiertas que cuelgan, máscaras que son la mano o el antebrazo, bultos estáticos en la cadera y no pega ese bulto con un agarre posterior. No bajar `hands.min_confidence` (0.50) ni `min_hand_confidence` (0.30).
+- **Objeto fantasma en la cadera (manos vacías, persona quieta).** SAM se come el pantalón, el puño o la manga. El pipeline tira palmas abiertas que cuelgan, máscaras que son la mano o el antebrazo, bultos estáticos en la cadera y no pega ese bulto con un agarre posterior. No bajar `hands.min_confidence` (0.50). `min_hand_confidence` (0.30) ya no bloquea un puño en un alcance.
 - **Celular que salta de mano en un frame.** No es un traspaso: o la pose L/R está invertida o YOLO mezcló dos detecciones. El rastreador no asocia L↔R en hueco ≤ 2 frames.
 - **SAM se come la estantería al alargar el brazo.** Un blob más lejos del torso que la palma se rechaza o se recorta al disco de la palma. El agarre real queda en la mano, no en el cartel.
 - **Objeto fusionado con bolso de hombro.** `accessory: true` en el YAML y `descartar_accesorios` en el pipeline. El ROI del bolso se ancla a la persona; una detección lejana de 1 frame se tira.

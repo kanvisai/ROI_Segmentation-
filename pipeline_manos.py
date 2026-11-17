@@ -9,8 +9,8 @@ cambia cómo se sigue la máscara del objeto; la detección y la salida son las 
   3. Cada candidato se puntúa contra las dos manos. Si las dos superan el umbral,
      el objeto queda como sostenido con «ambas».
   4. El YAML ``identificadores.yaml`` activa o desactiva la detección inmediata
-     (frame completo) de carrito, cesto, bolso, mochila, bolsa y celular. Las
-     clases que existen en COCO usan el id de Ultralytics; el resto, YOLOE.
+     (frame completo) de carrito, cesto, bolso, mochila, bolsa, celular y botella.
+     Las clases que existen en COCO usan el id de Ultralytics; el resto, YOLOE.
   5. El JSON guarda la traza completa y si el último ROI acabó dentro de un
      contenedor. El vídeo anotado pinta solo objetos y contenedores.
 """
@@ -56,6 +56,9 @@ YAML_IDENTIFICADORES = (
     RAIZ / "identifiers.yaml" if (RAIZ / "identifiers.yaml").is_file()
     else RAIZ / "identificadores.yaml"
 )
+# Mercancía en mano (no destinos). Nunca se pinta/siembra sin persona y palma cerca.
+MERCANCIA_MANO = frozenset({"celular", "botella"})
+IMAGEN_EXTS = {".jpg", ".jpeg", ".png"}
 
 MANO_EN = {"izquierda": "left", "derecha": "right", "ambas": "both", "sin_mano": "no_hand"}
 MANO_HUD = {"izquierda": "L", "derecha": "R", "ambas": "BOTH", "sin_mano": "FREE"}
@@ -258,6 +261,25 @@ def listar_videos(ruta: Path) -> list[Path]:
     if not videos:
         raise SystemExit(f"No hay vídeos en {ruta}")
     return videos
+
+
+def _hay_imagenes(carpeta: Path) -> bool:
+    try:
+        return any(
+            p.is_file() and p.suffix.lower() in IMAGEN_EXTS for p in carpeta.iterdir()
+        )
+    except OSError:
+        return False
+
+
+def listar_carpetas_frames(raiz: Path) -> list[Path]:
+    """La carpeta misma si tiene JPEG/PNG; si no, subcarpetas que sí las tienen."""
+    raiz = Path(raiz)
+    if not raiz.is_dir():
+        return []
+    if _hay_imagenes(raiz):
+        return [raiz]
+    return sorted(p for p in raiz.iterdir() if p.is_dir() and _hay_imagenes(p))
 
 
 def parsear_fps(valor):
@@ -514,7 +536,7 @@ def cargar_carpeta_frames(carpeta: Path) -> tuple[list[np.ndarray], list[int]]:
         raise SystemExit(f"No existe la carpeta {carpeta}")
     rutas = sorted(
         p for p in carpeta.iterdir()
-        if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png"}
+        if p.is_file() and p.suffix.lower() in IMAGEN_EXTS
     )
     if not rutas:
         raise SystemExit(f"No hay imágenes en {carpeta}")
@@ -732,6 +754,24 @@ def _radio_palma_objeto(mano, args) -> float:
     return min(radio, rp * 3.4, 88.0)
 
 
+def _instancia_parece_pack(inst, mano=None) -> bool:
+    """Caja/cartón rectangular en la palma, más grande que un puño vacío."""
+    if inst is None or getattr(inst, "caja", None) is None:
+        return False
+    w = max(1.0, float(inst.caja[2] - inst.caja[0]))
+    h = max(1.0, float(inst.caja[3] - inst.caja[1]))
+    area = float(getattr(inst, "area", 0) or 0)
+    rel = max(w, h) / min(w, h)
+    relleno = area / (w * h)
+    if area < 400.0 or not (1.15 <= rel <= 5.5) or relleno < 0.40:
+        return False
+    if mano is not None:
+        rp = max(8.0, float(getattr(mano, "radio_palma", 24.0) or 24.0))
+        if max(w, h) < 1.55 * rp:
+            return False
+    return True
+
+
 def _pegado_a_palma(inst: Instancia, mano, args) -> bool:
     """True si el centro toca la palma, la muñeca o las yemas. Una caja grande no vale."""
     radio = _radio_palma_objeto(mano, args)
@@ -746,28 +786,38 @@ def _pegado_a_palma(inst: Instancia, mano, args) -> bool:
             return True
     w = max(1.0, float(inst.caja[2] - inst.caja[0]))
     h = max(1.0, float(inst.caja[3] - inst.caja[1]))
+    # Pack rectangular: la caja es mayor que el puño, pero la palma sigue dentro.
     if max(w, h) > radio * 2.8:
-        return False
+        return _dentro_de_caja(palma, inst.caja, margen=8.0)
     return _dentro_de_caja(palma, inst.caja, margen=6.0) and (
-        float(np.hypot(cx - palma[0], cy - palma[1])) <= radio * 1.15
+        float(np.hypot(cx - palma[0], cy - palma[1])) <= radio * 1.35
     )
 
 
-def _clip_instancia_a_palma(inst: Instancia, mano, args, contexto=None) -> Instancia | None:
-    """Si SAM se comió la balda, se queda solo el disco de la palma."""
+def _clip_instancia_a_palma(
+    inst: Instancia, mano, args, contexto=None, radio_rel: float = 1.5
+) -> Instancia | None:
+    """Si SAM se comió la balda o el torso, se queda la zona de la palma (pack incluido)."""
     if inst is None or mano is None or inst.mascara is None:
         return None
     palma = mano.palma or mano.punto
-    rp = max(10.0, float(getattr(mano, "radio_palma", 24.0) or 24.0) * 1.5)
+    rel = max(1.2, float(radio_rel or 1.5))
+    rp = max(10.0, float(getattr(mano, "radio_palma", 24.0) or 24.0) * rel)
     if contexto is not None and getattr(contexto, "personas", None):
         ph = max(float(max(contexto.personas, key=lambda p: p.altura).altura), 40.0)
-        rp = min(rp, max(10.0, 0.07 * ph))
+        tope = 0.16 * ph if rel >= 2.0 else 0.07 * ph
+        rp = min(max(rp, 0.08 * ph if rel >= 2.0 else rp), max(10.0, tope))
     alto, ancho = inst.mascara.shape[:2]
     cy = int(round(float(palma[1])))
     cx = int(round(float(palma[0])))
     yy, xx = np.ogrid[:alto, :ancho]
     disco = (xx - cx) ** 2 + (yy - cy) ** 2 <= rp * rp
-    recorte = np.logical_and(inst.mascara, disco)
+    half = max(12, int(round(rp)))
+    x1b, y1b = max(0, cx - half), max(0, cy - half)
+    x2b, y2b = min(ancho, cx + half + 1), min(alto, cy + int(1.15 * half) + 1)
+    caja_m = np.zeros_like(disco)
+    caja_m[y1b:y2b, x1b:x2b] = True
+    recorte = np.logical_and(inst.mascara, np.logical_or(disco, caja_m))
     minima = max(40, int(getattr(args, "area_min", 80) or 80) // 2)
     if int(np.count_nonzero(recorte)) < minima:
         return None
@@ -858,6 +908,45 @@ def _mano_junto_al_torso(mano, contexto) -> bool:
     return mano is not None and not _mano_lejos_del_torso(mano, contexto)
 
 
+def _saltar_busqueda_en_palma(mano, contexto, args, umbral_dedos: float) -> bool:
+    """True si esta palma no lanza YOLO/SAM.
+
+    Con MediaPipe, un score de dedos bajo suele ser puño cerrado u oclusión, no
+    palma vacía. En un alcance a la estantería o un puño que no cuelga se busca
+    igual (el artículo robado no es un móvil). Palma abierta o brazo colgando
+    junto al muslo sí se saltan.
+    """
+    if float(getattr(mano, "confianza", 0.0) or 0.0) < float(
+        getattr(contexto, "conf_dibujo", 0.20) or 0.20
+    ):
+        return True
+    if getattr(mano, "abierta", False) and _brazo_cuelga_al_costado(mano, contexto):
+        return True
+    if not getattr(args, "mediapipe", False):
+        return False
+    if float(getattr(mano, "confianza_dedos", 0.0) or 0.0) >= umbral_dedos:
+        return False
+    # Score de dedos bajo: puño cerrado u oclusión. Se busca igual (pack en la
+    # cadera, alcance a la estantería). Solo se salta si el brazo cuelga al muslo.
+    return _brazo_cuelga_al_costado(mano, contexto)
+
+
+def _semilla_objeto_en_punyo(mano, alto: int, ancho: int) -> Instancia | None:
+    """Disco compacto en el puño cuando SAM no ve el artículo (ocultación)."""
+    if mano is None or getattr(mano, "abierta", False):
+        return None
+    palma = mano.palma or mano.punto
+    rp = max(10.0, min(26.0, float(getattr(mano, "radio_palma", 16.0) or 16.0) * 0.90))
+    cx, cy = int(round(float(palma[0]))), int(round(float(palma[1])))
+    if not (0 <= cx < ancho and 0 <= cy < alto):
+        return None
+    yy, xx = np.ogrid[:alto, :ancho]
+    disco = (xx - cx) ** 2 + (yy - cy) ** 2 <= rp * rp
+    if int(np.count_nonzero(disco)) < 40:
+        return None
+    return Instancia.desde_mascara(disco, etiqueta="objeto")
+
+
 def candidatos_en_munecas(frame, contexto, detector, sam, args) -> list[Instancia]:
     """Objetos compactos pegados a cada palma. El recorte solo limita la búsqueda."""
     alto, ancho = frame.shape[:2]
@@ -872,22 +961,13 @@ def candidatos_en_munecas(frame, contexto, detector, sam, args) -> list[Instanci
     # Persona de lado: el bbox se estrecha y 2 % del área rechaza una botella en el puño.
     area_max = max(float(area_max), 1800.0)
     candidatos: list[Instancia] = []
-    umbral_mano = float(getattr(contexto, "conf_dibujo", 0.20) or 0.20)
     umbral_dedos = float(
         getattr(getattr(args, "config_manos", None), "min_hand_confidence", 0.30) or 0.30
     )
     for mano in contexto.manos:
-        if float(mano.confianza) < umbral_mano:
+        if _saltar_busqueda_en_palma(mano, contexto, args, umbral_dedos):
             continue
-        # Dedos (no muñecas): sin palma de Hands o score < 0.3 no se lanza SAM.
-        if getattr(args, "mediapipe", False) and float(
-            getattr(mano, "confianza_dedos", 0.0) or 0.0
-        ) < umbral_dedos:
-            continue
-        # Palma abierta que cuelga al costado: no hay artículo. En el torso
-        # (puño que vuelve de la estantería) sí se busca.
-        if getattr(mano, "abierta", False) and _brazo_cuelga_al_costado(mano, contexto):
-            continue
+        lejos = _mano_lejos_del_torso(mano, contexto)
         if _palma_fuera_del_cuerpo(mano, contexto):
             palma = mano.palma or mano.punto
             radio = max(36.0, min(64.0, float(getattr(mano, "radio_palma", 24.0) or 24.0) * 4.0))
@@ -896,18 +976,21 @@ def candidatos_en_munecas(frame, contexto, detector, sam, args) -> list[Instanci
             x2 = int(min(ancho, round(float(palma[0]) + radio)))
             y2 = int(min(alto, round(float(palma[1]) + radio)))
         else:
-            x1, y1, x2, y2, _radio = caja_muneca(
-                mano, args.padding_muneca, args.crop_min, ancho, alto
-            )
+            pad = float(args.padding_muneca)
+            minimo = int(args.crop_min)
+            if not lejos:
+                minimo = max(minimo, 128)
+                pad = max(pad, 1.8)
+            x1, y1, x2, y2, _radio = caja_muneca(mano, pad, minimo, ancho, alto)
         if (x2 - x1) < 40 or (y2 - y1) < 40:
             continue
         locales = detector.detectar_en_caja(frame, (x1, y1, x2, y2), args.conf_objeto_crop)
         if sam is not None:
-            locales.extend(_sam_en_palma(sam, detector, frame, mano, (x1, y1, x2, y2), args))
+            locales.extend(_sam_en_palma(sam, detector, frame, mano, (x1, y1, x2, y2), args, contexto))
+        n_antes = len(candidatos)
         for inst in locales:
             if inst.es_persona or inst.area < args.area_min:
                 continue
-            lejos = _mano_lejos_del_torso(mano, contexto)
             demasiado = (
                 inst.area > area_max
                 or es_voluminoso(inst, contexto)
@@ -915,9 +998,8 @@ def candidatos_en_munecas(frame, contexto, detector, sam, args) -> list[Instanci
                 or _parece_estanteria(inst, mano, contexto)
             )
             if demasiado:
-                if not lejos and not _mano_lateral_respecto_cadera(mano, contexto):
-                    continue
-                inst = _clip_instancia_a_palma(inst, mano, args, contexto)
+                # Pack rectangular en la cadera: recortar a la palma, no tirar.
+                inst = _clip_instancia_a_palma(inst, mano, args, contexto, radio_rel=2.6)
                 if inst is None:
                     continue
             if not _dentro_de_caja(inst.centro, (x1, y1, x2, y2)):
@@ -928,30 +1010,48 @@ def candidatos_en_munecas(frame, contexto, detector, sam, args) -> list[Instanci
                 continue
             if _parece_brazo_o_suelo(inst, contexto):
                 continue
-            if _mascara_es_antebrazo(inst, mano, contexto):
+            pack = _instancia_parece_pack(inst, mano)
+            if _mascara_es_antebrazo(inst, mano, contexto) and not pack:
                 continue
-            if mascara_es_la_mano(inst, mano) and not lejos:
+            if mascara_es_la_mano(inst, mano) and not lejos and not pack:
                 continue
-            if _parece_ropa_o_muslo(frame, inst, mano, contexto):
+            if _parece_ropa_o_muslo(frame, inst, mano, contexto) and not pack:
                 continue
             candidatos.append(inst)
+        if (
+            len(candidatos) == n_antes
+            and not getattr(mano, "abierta", False)
+            and _palma_fuera_del_cuerpo(mano, contexto)
+        ):
+            semilla = _semilla_objeto_en_punyo(mano, alto, ancho)
+            if (
+                semilla is not None
+                and _pegado_a_palma(semilla, mano, args)
+                and _forma_de_objeto(semilla, args)
+            ):
+                candidatos.append(semilla)
     return _sin_duplicados(candidatos)
 
 
 def _forma_de_objeto(inst: Instancia, args) -> bool:
-    """Descarta brazos y baldas: el objeto sostenido es compacto y poco alargado."""
+    """Descarta brazos y baldas. Un pack rectangular (caja, cartón) sí pasa."""
     x1, y1, x2, y2 = inst.caja
     ancho, alto = max(1, x2 - x1), max(1, y2 - y1)
-    if max(ancho, alto) / min(ancho, alto) > args.relacion_max:
+    rel = max(ancho, alto) / min(ancho, alto)
+    relleno = inst.area / float(ancho * alto)
+    limite = float(getattr(args, "relacion_max", 3.0) or 3.0)
+    if rel > limite * 1.55:
         return False
-    return inst.area / float(ancho * alto) >= args.relleno_min
+    if rel > limite:
+        return relleno >= max(0.45, float(getattr(args, "relleno_min", 0.3) or 0.3))
+    return relleno >= float(getattr(args, "relleno_min", 0.3) or 0.3)
 
 
-def _caja_punyo_en_recorte(mano, caja) -> tuple[int, int, int, int]:
-    """Caja apretada alrededor del puño, para que SAM no se coma el torso."""
+def _caja_punyo_en_recorte(mano, caja, radio_rel: float = 2.2) -> tuple[int, int, int, int]:
+    """Caja alrededor del puño (radio_rel mayor = pack rectangular)."""
     x1, y1, x2, y2 = caja
     palma = mano.palma or mano.punto
-    r = max(12.0, float(getattr(mano, "radio_palma", 24.0) or 24.0) * 2.2)
+    r = max(12.0, float(getattr(mano, "radio_palma", 24.0) or 24.0) * float(radio_rel))
     bx1 = int(max(0, palma[0] - r - x1))
     by1 = int(max(0, palma[1] - r - y1))
     bx2 = int(min(x2 - x1, palma[0] + r - x1))
@@ -961,7 +1061,7 @@ def _caja_punyo_en_recorte(mano, caja) -> tuple[int, int, int, int]:
     return (bx1, by1, bx2, by2)
 
 
-def _sam_en_palma(sam, detector, frame, mano, caja, args) -> list[Instancia]:
+def _sam_en_palma(sam, detector, frame, mano, caja, args, contexto=None) -> list[Instancia]:
     """MobileSAM en la palma: solo la mancha compacta más cercana, no la estantería."""
     alto, ancho = frame.shape[:2]
     x1, y1, x2, y2 = caja
@@ -975,22 +1075,28 @@ def _sam_en_palma(sam, detector, frame, mano, caja, args) -> list[Instancia]:
     rp = max(8.0, float(getattr(mano, "radio_palma", 24.0) or 24.0))
     area_max = min(
         float(args.area_max_px),
-        max(400.0, float(np.pi * (rp * 2.2) ** 2)),
+        max(400.0, float(np.pi * (rp * 3.2) ** 2)),
     )
-    mejor, mejor_dist = None, 1e9
+    mejor, mejor_clave = None, (1, 1e9)
     crudos = list(sam.segmentar(recorte, puntos=puntos))
     crudos.extend(sam.segmentar(recorte, cajas=[_caja_punyo_en_recorte(mano, caja)]))
+    crudos.extend(sam.segmentar(recorte, cajas=[_caja_punyo_en_recorte(mano, caja, radio_rel=3.4)]))
     for inst in crudos:
         proyectada = detector.reproyectar_desde_recorte(inst, caja, ancho, alto)
         if proyectada is None:
             continue
-        if proyectada.area < args.area_min or proyectada.area > area_max:
+        if proyectada.area < args.area_min:
             continue
+        if proyectada.area > area_max:
+            proyectada = _clip_instancia_a_palma(proyectada, mano, args, contexto, radio_rel=2.6)
+            if proyectada is None:
+                continue
         if not _pegado_a_palma(proyectada, mano, args) or not _forma_de_objeto(proyectada, args):
             continue
         dist = float(np.hypot(proyectada.centro[0] - palma[0], proyectada.centro[1] - palma[1]))
-        if dist < mejor_dist:
-            mejor, mejor_dist = proyectada, dist
+        clave = (0 if _instancia_parece_pack(proyectada, mano) else 1, dist)
+        if clave < mejor_clave:
+            mejor, mejor_clave = proyectada, clave
     if mejor is None:
         return []
     mejor.etiqueta = "objeto"
@@ -1038,7 +1144,13 @@ def puntuar_manos(mascara: np.ndarray, caja, contexto, args) -> dict:
         contacto = float((detalle.get(lado) or {}).get("contacto") or 0.0)
     mano_lado = next((m for m in contexto.manos if m.lado == lado), None)
     es_mano = bool(mano_lado is not None and mascara_es_la_mano(inst, mano_lado))
-    en_mano = bool(lado) and score >= args.umbral_agarre and contacto >= args.contacto_min and not es_mano
+    es_mano_vacia = es_mano and bool(getattr(mano_lado, "abierta", False))
+    en_mano = (
+        bool(lado)
+        and score >= args.umbral_agarre
+        and contacto >= args.contacto_min
+        and not es_mano_vacia
+    )
     return {
         "mano": lado if en_mano else None,
         "score": float(score),
@@ -1073,6 +1185,12 @@ class DetectorIdentificadores:
         for ident in identificadores:
             if ident.cuerpo:
                 print(f"    {ident.clave}: ROI from pose (hips)")
+                continue
+            if ident.clave in MERCANCIA_MANO:
+                print(
+                    f"    {ident.clave}: solo recorte de muñeca "
+                    "(no se etiqueta en el frame completo)"
+                )
                 continue
             uid = _id_ultralytics(nombres, ident)
             if uid is not None:
@@ -1421,7 +1539,7 @@ def _persona_sale_de_escena(contexto, margen: int = 10) -> bool:
 
 
 def _de_espaldas(contexto) -> bool:
-    """De espaldas de verdad (orejas sin cara). Mirar al cesto no cuenta: la cara se oculta."""
+    """De espaldas de verdad (las dos orejas, sin cara). Un perfil de pasillo no cuenta."""
     if contexto is None or not getattr(contexto, "personas", None):
         return False
     persona = max(contexto.personas, key=lambda p: p.altura)
@@ -1430,8 +1548,14 @@ def _de_espaldas(contexto) -> bool:
         return False
     nariz = float(kp[0][2])
     ojos = max(float(kp[1][2]), float(kp[2][2])) if len(kp) > 2 else 0.0
-    orejas = max(float(kp[3][2]), float(kp[4][2])) if len(kp) > 4 else 0.0
-    return orejas >= 0.30 and nariz < 0.22 and ojos < 0.22
+    oreja_izq = float(kp[3][2]) if len(kp) > 3 else 0.0
+    oreja_der = float(kp[4][2]) if len(kp) > 4 else 0.0
+    if not (oreja_izq >= 0.22 and oreja_der >= 0.22 and nariz < 0.22 and ojos < 0.22):
+        return False
+    # Hands vio palma real: perfil con una oreja alta no se trata como de espaldas.
+    if any(float(getattr(m, "confianza_dedos", 0.0) or 0.0) >= 0.20 for m in (contexto.manos or [])):
+        return False
+    return True
 
 
 def _vector_codo_muneca(mano, contexto) -> tuple[float, float] | None:
@@ -1609,6 +1733,15 @@ def _deteccion_identificador_invalida(det: dict, ancho: int, alto: int) -> bool:
             return True
         if area < 40:
             return True
+    if cat == "botella":
+        if score < 0.25:
+            return True
+        if area > 0.012 * frame_area:
+            return True
+        if max(w, h) > 0.28 * max(alto, 1):
+            return True
+        if area < 40:
+            return True
     if cat in ("bolso", "mochila"):
         if score < 0.30:
             return True
@@ -1621,6 +1754,25 @@ def _contexto_en(contextos, indice):
     if not contextos or indice < 0 or indice >= len(contextos):
         return None
     return contextos[indice]
+
+
+def _hay_persona_en(contexto) -> bool:
+    return contexto is not None and bool(getattr(contexto, "personas", None))
+
+
+def _identificador_con_persona(det, contexto) -> bool:
+    """Sin persona no hay identificadores. Botella/celular solo pegados a una palma."""
+    if not _hay_persona_en(contexto):
+        return False
+    cat = det.get("categoria")
+    if cat in MERCANCIA_MANO:
+        if not getattr(contexto, "manos", None):
+            return False
+        caja = det.get("caja")
+        if caja is None:
+            return False
+        return any(_mano_cerca_caja(m, caja, margen=36.0) for m in contexto.manos)
+    return True
 
 
 def seguir_contenedores(frames, detector, cada: int, iou_min: float = 0.3,
@@ -1638,11 +1790,14 @@ def seguir_contenedores(frames, detector, cada: int, iou_min: float = 0.3,
     pistas: list[dict] = []
     for indice in sorted(indices):
         contexto = _contexto_en(contextos, indice)
+        if not _hay_persona_en(contexto):
+            continue
         try:
             detecciones = detector.detectar(frames[indice])
         except Exception as exc:
             _aviso(f"frame {indice}: identificadores fallaron ({exc})")
             detecciones = []
+        detecciones = [d for d in detecciones if _identificador_con_persona(d, contexto)]
         if contexto is not None and hasattr(detector, "detectar_cuerpo"):
             try:
                 detecciones.extend(detector.detectar_cuerpo(contexto))
@@ -1709,6 +1864,7 @@ def seguir_contenedores(frames, detector, cada: int, iou_min: float = 0.3,
                 mejor["ultimo_frame"] = indice
                 mejor["scores"].append(det["score"])
                 mejor["cajas"][indice] = det["caja"]
+                mejor.setdefault("scores_por_frame", {})[indice] = float(det["score"])
                 mejor["accesorio"] = mejor.get("accesorio", False) or bool(det.get("accesorio"))
                 mejor["cuerpo"] = mejor.get("cuerpo", False) or bool(det.get("cuerpo"))
                 if det.get("lado"):
@@ -1722,6 +1878,7 @@ def seguir_contenedores(frames, detector, cada: int, iou_min: float = 0.3,
                         "caja": det["caja"],
                         "cajas": {indice: det["caja"]},
                         "scores": [det["score"]],
+                        "scores_por_frame": {indice: float(det["score"])},
                         "primer_frame": indice,
                         "ultimo_frame": indice,
                         "destino": bool(det.get("destino", False)),
@@ -1792,14 +1949,12 @@ def _limpiar_identificadores(pistas: list[dict], contextos, forma) -> list[dict]
         cat = pista.get("categoria")
         score = max(pista.get("scores") or [0.0])
         n = len(pista.get("cajas") or {})
-        if cat == "celular":
-            if score < 0.32:
+        if cat in MERCANCIA_MANO:
+            if cat == "celular" and score < 0.32:
                 continue
             if n < 2 and score < 0.40:
                 continue
-            if not _celular_junto_a_mano(pista, contextos) and not _celular_junto_a_persona(
-                pista, contextos
-            ):
+            if not _celular_junto_a_mano(pista, contextos):
                 continue
         if cat == "carrito" and n < 1:
             continue
@@ -3754,6 +3909,8 @@ def recortar_si_vuelve_al_cuerpo(objetos: list[Objeto], contenedores, contextos)
         frames = sorted(objeto.vistas)
         if len(frames) < 4:
             continue
+        if _objeto_parece_pack(objeto):
+            continue
         if any(_vista_en_mueble(objeto.vistas[f], contenedores, contextos) for f in frames):
             continue
         ancla = None
@@ -3999,26 +4156,45 @@ def _cerca_de_bolsillo_valido(objeto: Objeto, contenedores, contextos=None) -> b
     return False
 
 
+def _caja_cabe_en_mano(caja, ctx) -> bool:
+    """True si la caja es tamaño de artículo, no una balda entera de botellas."""
+    if caja is None:
+        return False
+    w = max(1.0, float(caja[2] - caja[0]))
+    h = max(1.0, float(caja[3] - caja[1]))
+    area = w * h
+    if ctx is not None and getattr(ctx, "personas", None):
+        persona = max(ctx.personas, key=lambda p: p.altura)
+        ph = max(float(persona.altura), 40.0)
+        if max(w, h) > 0.38 * ph:
+            return False
+        pa = max(
+            1.0,
+            float(persona.caja[2] - persona.caja[0]) * float(persona.caja[3] - persona.caja[1]),
+        )
+        if area > 0.12 * pa:
+            return False
+    return area <= 8000.0
+
+
 def sembrar_objetos_desde_identificadores(contenedores, contextos, args) -> list[Objeto]:
-    """Un celular pegado a la palma es el objeto en la mano si el recorte de muñeca no lo vio."""
+    """Mercancía (botella, celular) pegada a la palma si el recorte de muñeca no la vio."""
     pistas = []
     for cont in contenedores:
-        if cont.get("categoria") != "celular":
+        cat = cont.get("categoria")
+        if cat not in MERCANCIA_MANO:
             continue
         mascaras = {}
         agarres = {}
-        if float(cont.get("score_max") or 0.0) < 0.32:
+        minimo = 0.32 if cat == "celular" else 0.25
+        if float(cont.get("score_max") or 0.0) < minimo:
             continue
         for frame, caja in (cont.get("cajas") or {}).items():
             ctx = _contexto_en(contextos, frame)
             if ctx is None or not ctx.manos:
                 continue
-            junto_mano = any(_mano_cerca_caja(m, caja, margen=48.0) for m in (ctx.manos or []))
-            junto_persona = bool(ctx.personas) and (
-                iou_cajas(caja, max(ctx.personas, key=lambda p: p.altura).caja) >= 0.01
-                or any(_mano_cerca_caja(m, caja, margen=72.0) for m in (ctx.manos or []))
-            )
-            if not junto_mano and not junto_persona:
+            junto_mano = any(_mano_cerca_caja(m, caja, margen=36.0) for m in (ctx.manos or []))
+            if not junto_mano or not _caja_cabe_en_mano(caja, ctx):
                 continue
             mascara = _mascara_de_caja(ctx.alto, ctx.ancho, caja)
             if not np.any(mascara):
@@ -4055,7 +4231,7 @@ def sembrar_objetos_desde_identificadores(contenedores, contextos, args) -> list
         )
     if not pistas:
         return []
-    print(f"  Objetos sembrados desde identificador celular: {len(pistas)}")
+    print(f"  Objetos sembrados desde identificador en mano: {len(pistas)}")
     return objetos_desde_pistas(pistas, contextos, args)
 
 
@@ -4521,7 +4697,7 @@ def extender_si_sigue_en_mano(frames, objetos, contextos, detector, sam, args, c
         return objetos
     extra = max(12, int(getattr(args, "hueco_parpadeo", 3) or 3) + 8)
     for objeto in objetos:
-        if len(objeto.vistas) < 2:
+        if len(objeto.vistas) < 1:
             continue
         ultima = max(objeto.vistas)
         vista = objeto.vistas[ultima]
@@ -4530,20 +4706,25 @@ def extender_si_sigue_en_mano(frames, objetos, contextos, detector, sam, args, c
         if _vista_en_mueble(vista, contenedores, contextos):
             continue
         lado = vista.mano if vista.mano in ("izquierda", "derecha") else None
+        pack = _objeto_parece_pack(objeto)
         for indice in range(int(ultima) + 1, min(len(frames), int(ultima) + extra + 1)):
             if indice >= len(contextos) or indice in objeto.vistas:
                 continue
             ctx = contextos[indice]
             if not getattr(ctx, "manos", None):
                 break
-            if lado and any(
-                getattr(m, "abierta", False)
-                and m.lado == lado
-                and not _mano_lejos_del_torso(m, ctx)
-                for m in ctx.manos
+            if (
+                not pack
+                and lado
+                and any(
+                    getattr(m, "abierta", False)
+                    and m.lado == lado
+                    and not _mano_lejos_del_torso(m, ctx)
+                    for m in ctx.manos
+                )
             ):
                 break
-            if _mano_detras_del_tronco(_mano_del_lado(ctx, lado), ctx):
+            if not pack and _mano_detras_del_tronco(_mano_del_lado(ctx, lado), ctx):
                 break
             try:
                 hallados = objetos_del_frame(frames[indice], ctx, detector, sam, copy(args))
@@ -4562,19 +4743,23 @@ def extender_si_sigue_en_mano(frames, objetos, contextos, detector, sam, args, c
                     continue
                 if dist < mejor_d:
                     mejor, mejor_d = inst, dist
-            if mejor is not None and mejor_d <= 96.0:
+            if mejor is not None and mejor_d <= (140.0 if pack else 96.0):
                 _registrar_mascara(objeto, indice, mejor.mascara, contextos, args)
                 vista = objeto.vistas.get(indice, vista)
+                pack = pack or _objeto_parece_pack(objeto)
                 continue
             mano = _mano_del_lado(ctx, lado) if lado else None
-            if mano is None or getattr(mano, "abierta", False):
+            if mano is None:
                 break
-            if _mano_junto_al_torso(mano, ctx):
+            if getattr(mano, "abierta", False) and not pack:
+                break
+            # Pack rectangular en la cadera: se sigue. Puño vacío al torso: no.
+            if _mano_junto_al_torso(mano, ctx) and not pack:
                 break
             palma = mano.palma or mano.punto
             dx = float(palma[0] - vista.centro[0])
             dy = float(palma[1] - vista.centro[1])
-            if float(np.hypot(dx, dy)) > 72.0:
+            if float(np.hypot(dx, dy)) > (140.0 if pack else 72.0):
                 break
             x1, y1, x2, y2 = vista.caja
             nueva = _clip_caja((x1 + dx, y1 + dy, x2 + dx, y2 + dy), ctx.ancho, ctx.alto)
@@ -4588,9 +4773,31 @@ def extender_si_sigue_en_mano(frames, objetos, contextos, detector, sam, args, c
     return objetos
 
 
+def _objeto_parece_pack(objeto: Objeto) -> bool:
+    """Caja/cartón rectangular en la palma, no un puño vacío."""
+    if not objeto.vistas:
+        return False
+    rels, areas, fills = [], [], []
+    for vista in objeto.vistas.values():
+        w = max(1.0, float(vista.caja[2] - vista.caja[0]))
+        h = max(1.0, float(vista.caja[3] - vista.caja[1]))
+        rels.append(max(w, h) / min(w, h))
+        areas.append(float(vista.area))
+        fills.append(float(vista.area) / (w * h))
+    if not rels:
+        return False
+    return (
+        float(np.median(areas)) >= 400.0
+        and 1.15 <= float(np.median(rels)) <= 5.5
+        and float(np.median(fills)) >= 0.40
+    )
+
+
 def _bulto_estatico_en_cadera(objeto: Objeto, contextos) -> bool:
     """Bulto de ropa en la cadera: la palma no se aleja del torso en toda la traza."""
     if not objeto.vistas or contextos is None:
+        return False
+    if _objeto_parece_pack(objeto):
         return False
     if _acaba_detras_del_tronco(objeto, contextos):
         return False
@@ -4620,6 +4827,8 @@ def _bulto_estatico_en_cadera(objeto: Objeto, contextos) -> bool:
 
 def _parece_mano_vacia(objeto: Objeto, contextos) -> bool:
     """Palma o manga sin artículo: no se inventa un objeto para llevarlo al bolsillo."""
+    if _objeto_parece_pack(objeto):
+        return False
     if not objeto.vistas:
         return True
     votos = 0
@@ -4994,12 +5203,25 @@ def _oculto_dentro_de_la_persona(objeto: Objeto, contextos) -> bool:
     if ctx is None or not getattr(ctx, "personas", None):
         return False
     persona = max(ctx.personas, key=lambda p: p.altura)
-    if _fraccion_caja_dentro(vista.caja, persona.caja) < 0.45 and not _dentro_de_caja(
+    dentro = _fraccion_caja_dentro(vista.caja, persona.caja) >= 0.45 or _dentro_de_caja(
         vista.centro, persona.caja, 8.0
-    ):
-        return False
-    mano_u = _mano_del_lado(ctx, vista.mano) if vista.mano in ("izquierda", "derecha") else None
-    del mano_u
+    )
+    if not dentro:
+        # Última vista en la estantería: cuenta si la palma vuelve al torso.
+        volvio = False
+        lado = vista.mano if vista.mano in ("izquierda", "derecha") else None
+        for ctx2 in contextos[ultima + 1 :]:
+            mano = _mano_del_lado(ctx2, lado) if lado else None
+            if mano is None and getattr(ctx2, "manos", None):
+                mano = next(iter(ctx2.manos), None)
+            if _mano_junto_al_torso(mano, ctx2) or _brazo_cuelga_al_costado(mano, ctx2):
+                volvio = True
+                break
+            if not getattr(ctx2, "manos", None) and _pose_manos_libres(ctx2):
+                volvio = True
+                break
+        if not volvio:
+            return False
     libres = 0
     for ctx2 in contextos[ultima + 1 :]:
         manos = getattr(ctx2, "manos", None) or []
@@ -5028,9 +5250,10 @@ def _informe_estado_video(informes: list[dict]) -> dict | None:
         return None
     rango = {
         "inside_container": 0,
-        "in_hand": 1,
-        "released": 2,
-        "disappeared": 3,
+        # Un puño que sigue in_hand no tapa la ocultación del artículo robado.
+        "disappeared": 1,
+        "in_hand": 2,
+        "released": 3,
         "no_data": 4,
         "no_hands": 5,
     }
@@ -5055,6 +5278,43 @@ def _final_state_video(informes: list[dict]) -> str:
 
 def _etiqueta_mano(mano: str | None) -> str:
     return MANO_HUD.get(mano or "sin_mano", "FREE")
+
+
+def _score_identificador_en_frame(pista: dict, indice: int) -> float | None:
+    """Confianza a pintar en este JPEG: score de ese frame, o la del clip."""
+    sp = pista.get("scores_por_frame") or {}
+    if indice in sp:
+        return float(sp[indice])
+    if pista.get("categoria") == "celular" and pista.get("confidence") is not None:
+        return float(pista["confidence"])
+    if _es_bolsillo(pista):
+        return None
+    if pista.get("score_max") is not None:
+        return float(pista["score_max"])
+    return None
+
+
+def _confianzas_hud(informes, contenedores) -> list[str]:
+    """Textos cortos para la barra del overlay (phone / inside)."""
+    partes = []
+    phone = None
+    inside = None
+    for info in informes or []:
+        c = info.get("cell_phone_confidence")
+        if c is not None:
+            phone = c if phone is None else max(phone, float(c))
+        c = info.get("inside_container_confidence")
+        if c is not None:
+            inside = c if inside is None else max(inside, float(c))
+    if phone is None:
+        for pista in contenedores or []:
+            if pista.get("categoria") == "celular" and pista.get("confidence") is not None:
+                phone = float(pista["confidence"]) if phone is None else max(phone, float(pista["confidence"]))
+    if phone is not None:
+        partes.append(f"phone {float(phone):.2f}")
+    if inside is not None:
+        partes.append(f"inside {float(inside):.2f}")
+    return partes
 
 
 def _overlay_objeto(objeto: Objeto, indice: int, contenedores, contextos=None) -> tuple:
@@ -5088,7 +5348,7 @@ def anotar(frames, destino: Path, objetos: list[Objeto], contenedores, fps_salid
            fps_video: float, indices_origen: list[int] | None,
            carpeta_frames: Path | None, alfa: float,
            contextos=None, dibujar_esqueleto: bool = True,
-           prefijo_frame: str | None = None) -> int:
+           prefijo_frame: str | None = None, informes=None) -> int:
     """Máscaras de objeto, ROI de identificadores y pose YOLO de la cintura hacia arriba."""
     if not frames:
         return 0
@@ -5116,6 +5376,12 @@ def anotar(frames, destino: Path, objetos: list[Objeto], contenedores, fps_salid
                     else:
                         manos_ocupadas.add(vista_o.mano)
             for pista in contenedores:
+                if not _hay_persona_en(ctx_i):
+                    continue
+                # Botella/celular de góndola no se pintan: el objeto en mano
+                # es la máscara magenta del recorte de muñeca.
+                if pista.get("categoria") in MERCANCIA_MANO:
+                    continue
                 if pista.get("accesorio") or pista.get("cuerpo"):
                     hold = HOLD_ACCESORIO
                 elif pista.get("destino"):
@@ -5152,8 +5418,12 @@ def anotar(frames, destino: Path, objetos: list[Objeto], contenedores, fps_salid
                 x1, y1, x2, y2 = caja
                 color = COLOR_CONTENEDOR if pista.get("destino") else COLOR_IDENTIFICADOR
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                etiqueta = pista["id"]
+                score_f = _score_identificador_en_frame(pista, indice)
+                if score_f is not None:
+                    etiqueta = f"{pista['id']} {score_f:.2f}"
                 cv2.putText(
-                    frame, pista["id"], (x1 + 4, max(18, y1 - 8)),
+                    frame, etiqueta, (x1 + 4, max(18, y1 - 8)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA,
                 )
             for objeto in objetos:
@@ -5171,9 +5441,18 @@ def anotar(frames, destino: Path, objetos: list[Objeto], contenedores, fps_salid
                     _aviso(f"frame {orig}: overlay de objeto {objeto.id} falló ({exc})")
                 x1, y1, x2, y2 = vista.caja
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                etiqueta_obj = f"obj {objeto.id} {_etiqueta_mano(vista.mano)} {vista.score:.2f}"
+                info_obj = next(
+                    (i for i in (informes or []) if i.get("id") == objeto.id),
+                    None,
+                )
+                if info_obj and info_obj.get("cell_phone_confidence") is not None:
+                    etiqueta_obj += f" phone {info_obj['cell_phone_confidence']:.2f}"
+                if info_obj and info_obj.get("inside_container_confidence") is not None:
+                    etiqueta_obj += f" in {info_obj['inside_container_confidence']:.2f}"
                 cv2.putText(
                     frame,
-                    f"obj {objeto.id} {_etiqueta_mano(vista.mano)} {vista.score:.2f}",
+                    etiqueta_obj,
                     (x1, max(16, y1 - 6)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA,
                 )
@@ -5182,7 +5461,11 @@ def anotar(frames, destino: Path, objetos: list[Objeto], contenedores, fps_salid
                     dibujar_pose(frame, contextos[indice])
                 except Exception as exc:
                     _aviso(f"frame {orig}: esqueleto falló ({exc})")
-            cv2.rectangle(frame, (0, 0), (ancho, 34), (0, 0, 0), -1)
+            extras_hud = _confianzas_hud(informes, contenedores)
+            if not _hay_persona_en(ctx_i) or not getattr(ctx_i, "manos", None):
+                extras_hud = []
+            hud_h = 56 if extras_hud else 34
+            cv2.rectangle(frame, (0, 0), (ancho, hud_h), (0, 0, 0), -1)
             activos = sum(
                 1 for o in objetos
                 if _overlay_objeto(o, indice, contenedores)[0] is not None
@@ -5194,8 +5477,13 @@ def anotar(frames, destino: Path, objetos: list[Objeto], contenedores, fps_salid
                 texto_hud = f"frame {orig}  t={t:.2f}s  handheld objects: {activos}"
             cv2.putText(
                 frame, texto_hud,
-                (12, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (240, 240, 240), 1, cv2.LINE_AA,
+                (12, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (240, 240, 240), 1, cv2.LINE_AA,
             )
+            if extras_hud:
+                cv2.putText(
+                    frame, "  ".join(extras_hud),
+                    (12, 46), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (240, 240, 240), 1, cv2.LINE_AA,
+                )
             if escritor is not None:
                 escritor.write(frame)
             if carpeta_frames is not None:
@@ -5421,10 +5709,16 @@ def anadir_argumentos_comunes(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--carpeta-frames", type=Path, default=None, dest="carpeta_frames",
-        help="Carpeta de JPEG/PNG (p. ej. videos/6_clip_r9_frames). "
-             "Sustituye al mp4: se procesan todas las imágenes. "
-             "Hace falta --fps entero (reloj de t=origen/fps, no muestreo). "
+        help="Carpeta de JPEG/PNG (p. ej. videos/a_clip_r12_frames_chunk_002). "
+             "Sustituye al mp4: se procesan todas las imágenes. Si la ruta es la "
+             "carpeta de vídeos (sin JPEG en la raíz), se recorren las subcarpetas "
+             "que sí tienen frames. Hace falta --fps entero. "
              "El número del nombre (frame_000.jpg → 0) es el índice de origen.",
+    )
+    parser.add_argument(
+        "--subcarpetas-frames", action="store_true", dest="subcarpetas_frames",
+        help="Con --videos DIR, procesa también cada subcarpeta que contenga "
+             "JPEG/PNG (además de los mp4). Hace falta --fps entero para esas carpetas.",
     )
     parser.add_argument("--salida", type=Path, default=Path("salidas"))
     parser.add_argument(
@@ -5477,7 +5771,7 @@ def anadir_argumentos_comunes(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--area-min", type=int, default=80)
     parser.add_argument("--area-max-px", type=int, default=6000)
     parser.add_argument("--area-max-persona", type=float, default=0.05)
-    parser.add_argument("--relacion-max", type=float, default=3.0)
+    parser.add_argument("--relacion-max", type=float, default=4.5)
     parser.add_argument("--relleno-min", type=float, default=0.3)
     parser.add_argument("--factor-palma", type=float, default=0.85,
                         help="Radio máximo del objeto respecto al radio del brazo. "
@@ -5533,11 +5827,12 @@ def anadir_argumentos_comunes(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _objeto_es_celular(objeto: Objeto, contenedores) -> bool:
+def _objeto_solapa_categoria(objeto: Objeto, contenedores, categorias) -> bool:
     if not contenedores or not objeto.vistas:
         return False
+    cats = categorias if isinstance(categorias, (set, frozenset, tuple, list)) else {categorias}
     for pista in contenedores:
-        if pista.get("categoria") != "celular":
+        if pista.get("categoria") not in cats:
             continue
         for frame, vista in objeto.vistas.items():
             caja_c = caja_contenedor(pista, int(frame), hold=6)
@@ -5546,6 +5841,15 @@ def _objeto_es_celular(objeto: Objeto, contenedores) -> bool:
             if iou_cajas(vista.caja, caja_c) >= 0.12 or _fraccion_caja_dentro(vista.caja, caja_c) >= 0.35:
                 return True
     return False
+
+
+def _objeto_es_celular(objeto: Objeto, contenedores) -> bool:
+    return _objeto_solapa_categoria(objeto, contenedores, ("celular",))
+
+
+def _objeto_es_mercancia(objeto: Objeto, contenedores) -> bool:
+    """Celular o botella (u otra mercancía COCO) solapada con la traza en mano."""
+    return _objeto_solapa_categoria(objeto, contenedores, MERCANCIA_MANO)
 
 
 def _mayoria_mano_abierta(objeto: Objeto, contextos) -> bool:
@@ -5593,6 +5897,7 @@ def quedarse_con_agarrados(objetos: list[Objeto], args, contenedores=None, conte
             for ctx in contextos
         )
         es_celular = _objeto_es_celular(objeto, contenedores)
+        es_mercancia = _objeto_es_mercancia(objeto, contenedores)
         acaba_mueble = False
         if contenedores and objeto.vistas:
             dest_tmp = contenedor_final(
@@ -5607,11 +5912,24 @@ def quedarse_con_agarrados(objetos: list[Objeto], args, contenedores=None, conte
                     _vista_en_mueble(objeto.vistas[f], contenedores, contextos)
                     for f in list(sorted(objeto.vistas))[-4:]
                 )
-        if _parece_mano_vacia(objeto, contextos) and not es_celular and not acaba_mueble:
+        detras = _acaba_detras_del_tronco(objeto, contextos)
+        oculto = _oculto_dentro_de_la_persona(objeto, contextos)
+        ocultacion = bool(oculto or detras or en_bolsillo or cerca_bolsillo)
+        if (
+            _parece_mano_vacia(objeto, contextos)
+            and not es_mercancia
+            and not acaba_mueble
+            and not ocultacion
+        ):
             continue
-        if _bulto_estatico_en_cadera(objeto, contextos) and not es_celular and not acaba_mueble:
+        if (
+            _bulto_estatico_en_cadera(objeto, contextos)
+            and not es_mercancia
+            and not acaba_mueble
+            and not ocultacion
+        ):
             continue
-        if not es_celular and not acaba_mueble and objeto.vistas:
+        if not es_mercancia and not acaba_mueble and not ocultacion and objeto.vistas:
             areas = [v.area for v in objeto.vistas.values()]
             en_cabeza = 0
             for frame, vista in objeto.vistas.items():
@@ -5623,16 +5941,14 @@ def quedarse_con_agarrados(objetos: list[Objeto], args, contenedores=None, conte
                     en_cabeza += 1
             if areas and float(np.median(areas)) < 220 and en_cabeza / len(objeto.vistas) >= 0.5:
                 continue
-        detras = _acaba_detras_del_tronco(objeto, contextos)
-        oculto = _oculto_dentro_de_la_persona(objeto, contextos)
-        if n < args.min_detecciones and not es_celular and not acaba_mueble:
+        if n < args.min_detecciones and not es_mercancia and not acaba_mueble:
             if not ((sale_con_objeto or sale_clip) and n >= 2 and ultima.mano) and not (
                 detras and n >= 1 and ultima.mano
             ) and not (oculto and n >= 1 and ultima.mano):
                 continue
-        if n / len(objeto.vistas) < 0.5 and not sale_con_objeto and not detras and not oculto and not es_celular and not acaba_mueble:
+        if n / len(objeto.vistas) < 0.5 and not sale_con_objeto and not detras and not oculto and not es_mercancia and not acaba_mueble:
             continue
-        if not es_celular and not acaba_mueble:
+        if not es_mercancia and not acaba_mueble:
             solidos = 0
             for frame, vista in objeto.vistas.items():
                 ctx_v = _contexto_en(contextos, int(frame)) if contextos is not None else None
@@ -5667,23 +5983,17 @@ def quedarse_con_agarrados(objetos: list[Objeto], args, contenedores=None, conte
 
     candidatos.sort(
         key=lambda o: (
-            int(_objeto_es_celular(o, contenedores)),
-            en_mano(o),
             _acaba_en_mueble(o),
+            int(
+                _objeto_es_mercancia(o, contenedores)
+                or _oculto_dentro_de_la_persona(o, contextos)
+                or _acaba_detras_del_tronco(o, contextos)
+            ),
+            en_mano(o),
             len(o.vistas),
         ),
         reverse=True,
     )
-    celulares = [o for o in candidatos if _objeto_es_celular(o, contenedores)]
-    if celulares:
-        fin_cel = max(max(o.vistas) for o in celulares)
-        candidatos = [
-            o for o in candidatos
-            if _objeto_es_celular(o, contenedores)
-            or min(o.vistas) <= fin_cel + 2
-        ]
-        if not candidatos:
-            candidatos = list(celulares)
     principal = candidatos[0]
     umbral = max(args.min_detecciones, int(0.35 * en_mano(principal)))
     mano_ppal = mano_dom(principal)
@@ -5826,7 +6136,7 @@ def escribir_salidas(
         frames, anotado, objetos, contenedores, fps_salida, fps, indices_origen,
         destino / "frames" if not args.sin_frames else None, args.alfa,
         contextos, dibujar_esqueleto=not args.sin_pose,
-        prefijo_frame=video.stem,
+        prefijo_frame=video.stem, informes=informes,
     )
     if not args.sin_frames:
         print(f"  {escritos} frames en {destino / 'frames'}")
@@ -6155,16 +6465,11 @@ def procesar_lote(
     height: int | None = None,
 ) -> int:
     """Procesa varios clips o una lista de arrays. Un fallo no aborta el resto."""
+    fallos = 0
+    fps_cli = fps if fps is not None else getattr(args, "fps", None)
     carpeta = getattr(args, "carpeta_frames", None)
-    if frames is None and carpeta is not None:
-        frames, origen_auto = cargar_carpeta_frames(carpeta)
-        if frames_origin is None:
-            frames_origin = getattr(args, "frames_origin", None) or origen_auto
-        fps = _fps_linea_temporal(fps if fps is not None else getattr(args, "fps", None))
-        if getattr(args, "video", None) is None:
-            args.video = Path(Path(carpeta).name)
+
     if frames is not None:
-        args.frames = frames
         if frames_origin is not None:
             args.frames_origin = frames_origin
         if fps is not None:
@@ -6173,14 +6478,42 @@ def procesar_lote(
             args.width = width
         if height is not None:
             args.height = height
-        videos = resolver_videos(args)
-    elif not videos:
-        videos = resolver_videos(args)
-    fallos = 0
-    for video in videos:
+        lista = resolver_videos(args) if not videos else videos
+        for video in lista:
+            if not procesar_video(
+                detectores, video, args, tecnologia, backend, modelo, seguir, extra,
+                frames=frames, frames_origin=frames_origin, fps=fps, width=width, height=height,
+            ):
+                fallos += 1
+        return fallos
+
+    carpetas: list[Path] = []
+    if carpeta is not None:
+        carpetas = listar_carpetas_frames(Path(carpeta))
+        if not carpetas:
+            raise SystemExit(f"No hay imágenes en {carpeta} ni en sus subcarpetas")
+    elif getattr(args, "subcarpetas_frames", False):
+        raiz = Path(getattr(args, "videos", None) or "videos")
+        carpetas = listar_carpetas_frames(raiz)
+        if not carpetas:
+            _aviso(f"--subcarpetas-frames: ninguna subcarpeta de {raiz} tiene JPEG/PNG")
+
+    if carpeta is None:
+        lista = videos or resolver_videos(args)
+        for video in lista:
+            if not procesar_video(
+                detectores, video, args, tecnologia, backend, modelo, seguir, extra,
+                frames=None, width=width, height=height,
+            ):
+                fallos += 1
+
+    for carp in carpetas:
+        fps_c = _fps_linea_temporal(fps_cli)
+        fr, origen = cargar_carpeta_frames(carp)
+        print(f"  Carpeta de frames: {carp}")
         if not procesar_video(
-            detectores, video, args, tecnologia, backend, modelo, seguir, extra,
-            frames=frames, frames_origin=frames_origin, fps=fps, width=width, height=height,
+            detectores, Path(carp.name), args, tecnologia, backend, modelo, seguir, extra,
+            frames=fr, frames_origin=origen, fps=fps_c, width=width, height=height,
         ):
             fallos += 1
     return fallos

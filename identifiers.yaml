@@ -1,4 +1,5 @@
-# Scene identifiers: detected on the full frame, without waiting for a hand.
+# Scene identifiers: cart/basket/bag/backpack on the full frame.
+# bottle and cell phone are NOT full-frame: only the wrist crop may see them.
 # Set active: false to disable a class without changing code.
 #
 # If the class exists in COCO, use the Ultralytics id and its English name:
@@ -35,7 +36,8 @@
 
 hands:
   min_confidence: 0.50
-  # MediaPipe palm/fingers (not the wrist). Below this, SAM is skipped.
+  # MediaPipe palm/fingers (not the wrist). Below this, an open hanging
+  # palm skips SAM; a closed fist or a reach to the shelf still searches.
   min_hand_confidence: 0.30
 
 identifiers:
@@ -95,6 +97,17 @@ identifiers:
     prompts:
       - cell phone
       - mobile phone
+
+  botella:
+    active: true
+    ultralytics_id: 39
+    name: bottle
+    destination: false
+    accessory: false
+    prompts:
+      - bottle
+      - beer bottle
+      - plastic bottle
 
   bolsillo:
     active: true

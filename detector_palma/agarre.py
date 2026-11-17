@@ -305,17 +305,20 @@ def anotar_agarre(
             contacto = float(detalle.get("contacto") or 0.0)
         mano_lado = next((m for m in contexto.manos if m.lado == lado), None)
         es_mano = bool(mano_lado is not None and mascara_es_la_mano(instancia, mano_lado))
+        # Palma abierta cuya máscara ES la mano: vacía. Puño cerrado: el artículo
+        # puede ir oculto en el puño (robo); no se tira solo por cubrir landmarks.
+        es_mano_vacia = es_mano and bool(getattr(mano_lado, "abierta", False))
         proximidad = float(detalle.get("proximidad") or 0.0)
         contacto_ok = (
             contacto >= MIN_CONTACTO_AGARRE
             or not contexto.manos
-            or (proximidad >= 0.55 and not es_mano)
+            or (proximidad >= 0.55 and not es_mano_vacia)
         )
         instancia.en_mano = bool(
             score >= umbral
             and (lado or not contexto.manos)
             and contacto_ok
-            and not es_mano
+            and not es_mano_vacia
         )
         anotadas.append(instancia)
     anotadas.sort(key=lambda i: i.score_agarre, reverse=True)

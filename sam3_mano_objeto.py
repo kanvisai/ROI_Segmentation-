@@ -1478,6 +1478,7 @@ def parsear_args() -> argparse.Namespace:
         conf_objeto_crop=0.15,
         factor_palma=0.85,
         distancia_max=280.0,
+        relacion_max=4.5,
     )
     return parser.parse_args()
 
