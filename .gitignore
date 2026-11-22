@@ -16,6 +16,8 @@ salidas/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.coverage
+htmlcov/
 *.egg-info/
 .ruff_cache/
 

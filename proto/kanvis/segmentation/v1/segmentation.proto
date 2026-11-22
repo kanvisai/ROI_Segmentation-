@@ -1,0 +1,46 @@
+syntax = "proto3";
+
+package kanvis.segmentation.v1;
+
+service SegmentationService {
+  rpc ApplySegmentation(SegmentationRequest) returns (SegmentationResponse);
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+}
+
+message SegmentationRequest {
+  string request_id = 1;
+  string trace_id = 2;
+  string session_id = 3;
+
+  // Option B: legacy Kanvis refs (same semantics as Sam3ReviewRequest)
+  string source_ref = 4;
+  string pose_chunk_ref = 5;
+  string image_chunk_ref = 6;
+  string span_spec = 7;
+  bool persist_to_minio = 8;
+  bool dry_run = 9;
+
+  // Option A: structured tenant path
+  string bucket = 10;
+  string retail_id = 11;
+  string store_id = 12;
+  string camera_id = 13;
+  string chunk_stem = 14;
+}
+
+message SegmentationResponse {
+  string request_id = 1;
+  // ok | error | skipped | pending
+  string status = 2;
+  string error_message = 3;
+  string tracking_json = 4;
+  string roi_fp_review_json = 5;
+  string tracking_ref = 6;
+}
+
+message HealthCheckRequest {}
+
+message HealthCheckResponse {
+  bool ready = 1;
+  string message = 2;
+}

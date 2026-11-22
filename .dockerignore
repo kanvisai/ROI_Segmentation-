@@ -1,0 +1,16 @@
+.git
+.venv
+videos
+videos*
+salidas
+__pycache__
+*.pyc
+.pytest_cache
+*.egg-info
+antiguo_proyecto
+fp_agosto
+checkpoints
+third_party
+Conclusiones.md
+docs/TEST_REPORT.md
+KANVIS_SEGMENTATION_SERVICE_SPEC.md

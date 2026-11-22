@@ -79,6 +79,11 @@ ROI_Segmentation-/
 ├── requirements-hoist.txt
 ├── Conclusiones.md                # Ranking empírico de las seis tecnologías
 ├── scripts.txt                    # Recetas de lanzamiento usadas en el laboratorio
+├── scripts/                       # build.sh, deploy.sh, smoke_*.sh, run_local_offline.sh
+├── kanvis_segmentation/           # Servicio gRPC standalone (puerto 50100)
+├── proto/kanvis/segmentation/v1/  # segmentation.proto
+├── docker-compose.segmentation.yml
+├── fixtures/session_001/          # Layout local tipo MinIO para smoke offline
 ├── pesos/                         # Checkpoints YOLO / YOLOE / MobileSAM (no en git)
 ├── videos/                        # Clips de entrada (no en git)
 ├── fp_agosto2026/                 # Clips locales de depuración (no en git; ver .gitignore)
@@ -784,3 +789,79 @@ contextos, pistas = detectar_objetos(frames, escena, detector, sam, args)
 - **`--frames` no es un flag de shell.** Hay que asignar `args.frames` o el kwarg `frames=` con `list[np.ndarray]`. `--fps`, `--width` y `--height` sí van por CLI, y tienen que ser enteros.
 
 100DOH y detectores mano-objeto de esa generación no entran: piden CUDA/PyTorch anteriores a los de esta máquina.
+
+---
+
+## Servicio Kanvis (`kanvis-segmentation`)
+
+Contenedor Docker autónomo: C2/C3 llaman a SAM 3 por **gRPC**. Lee frames de MinIO, corre el pipeline de este repo y devuelve `tracking_json` + `roi_fp_review` (esquema `c2_roi_fp_review_v1`). Especificación de contrato: `KANVIS_SEGMENTATION_SERVICE_SPEC.md`.
+
+### Puertos
+
+| Servicio | Puerto | Variable |
+|----------|--------|----------|
+| gRPC `SegmentationService` | **50100** | `KANVIS_SEGMENTATION_LISTEN` (default `0.0.0.0:50100`) |
+| Prometheus `/metrics` | **9109** | `KANVIS_SEGMENTATION_METRICS_PORT` |
+
+No se usa el 50052 (C2). El gRPC de este servicio es **50100**.
+
+### Qué hace una petición
+
+1. Resuelve la sesión por campos tenant (`bucket`, `retail_id`, `store_id`, `camera_id`, `session_id`, `chunk_stem`) o por refs C2 (`source_ref`, `pose_chunk_ref`, `image_chunk_ref`).
+2. Baja `chunk_XXX/frames/`, `frames_meta.json` y `poses_full.npy` (si falta: `poses_compat.npy` / `poses.npy`).
+3. Ancla al sujeto de la sesión (muñecas C1) y corre SAM 3.
+4. Responde `tracking_json` (compacto) y `roi_fp_review_json`. Con `persist_to_minio=true` y `dry_run=false` escribe `…/chunk_XXX/roi_tracking.json`.
+
+RPC: `ApplySegmentation`, `HealthCheck`. Proto: `proto/kanvis/segmentation/v1/segmentation.proto`.
+
+### Variables de entorno
+
+| Variable | Default | Uso |
+|----------|---------|-----|
+| `KANVIS_SEGMENTATION_LISTEN` | `0.0.0.0:50100` | Bind gRPC |
+| `KANVIS_SEGMENTATION_METRICS_PORT` | `9109` | Prometheus |
+| `SEGMENTATION_S3_ENDPOINT_URL` | `http://host.docker.internal:9000` | MinIO publicado en el host (`:9000`). Si el servicio y MinIO comparten red Docker, usa el hostname del contenedor MinIO. |
+| `SEGMENTATION_S3_ACCESS_KEY_ID` | — | |
+| `SEGMENTATION_S3_SECRET_ACCESS_KEY` | — | |
+| `SEGMENTATION_S3_REGION` | `us-east-1` | |
+| `SEGMENTATION_S3_SECURE` | `false` | TLS |
+| `SEGMENTATION_SAM3_SUMMARY` | `true` | `tracking.json` compacto |
+| `SEGMENTATION_SAM3_MIN_WRIST_VISIBLE_FRAMES` | `3` | Umbral de muñecas para no lanzar SAM |
+| `SEGMENTATION_SAM3_WRIST_MATCH_MAX_PX` | `140` | Radio del ancla de sesión |
+| `SEGMENTATION_IDENTIFIERS_YAML` | `identifiers.yaml` | Catálogo dentro de la imagen |
+| `SEGMENTATION_WORK_DIR` | `/tmp/kanvis-segmentation` | Scratch |
+
+### Scripts
+
+Todos salen distinto de cero si fallan, imprimen `PASS` / `FAIL` y con `DRY_RUN=1` no escriben en MinIO.
+
+| Script | Función |
+|--------|---------|
+| `scripts/build.sh` | Construye `kanvis-segmentation:gpu` (`TARGET=cpu` para CPU) |
+| `scripts/deploy.sh` | Build + `docker compose -f docker-compose.segmentation.yml up -d` |
+| `scripts/smoke_grpc.sh` | HealthCheck en `localhost:50100` (`FORCE_RPC=1` fuerza la llamada) |
+| `scripts/smoke_minio.sh` | `ApplySegmentation` contra `SOURCE_REF` + `POSE_REF` |
+| `scripts/run_local_offline.sh` | Fixture local `fixtures/session_001/` (sin MinIO) |
+| `scripts/gen_proto.sh` | Regenera stubs gRPC |
+
+```bash
+# Imagen GPU y arranque (publica 50100 y 9109)
+bash scripts/build.sh
+bash scripts/deploy.sh
+
+# Health
+TARGET=localhost:50100 FORCE_RPC=1 bash scripts/smoke_grpc.sh
+
+# MinIO (DRY_RUN=1 no escribe roi_tracking.json)
+export SOURCE_REF="s3://kanvis-chunks/sessions/<retail>/<store>/<camera>/<session>/"
+export POSE_REF="${SOURCE_REF}chunk_001/poses_full.npy"
+export TARGET="localhost:50100"
+DRY_RUN=1 bash scripts/smoke_minio.sh
+
+# Offline, sin MinIO
+SESSION_ROOT=fixtures/session_001 DRY_RUN=0 bash scripts/run_local_offline.sh
+```
+
+Compose: `docker-compose.segmentation.yml` (mapeo `50100:50100` y `9109:9109`). Cliente: `tools/grpc_smoke_client.py`. Runner local: `tools/run_offline_segmentation.py`. Tests: `.venv/bin/python -m pytest tests -q`. Informe: `docs/TEST_REPORT.md`.
+
+La imagen GPU instala `libegl1` (MediaPipe Holistic) y reinstala `torchvision` desde el índice cu128 (Ultralytics deja un wheel sin `torchvision::nms`). MinIO se alcanza por `host.docker.internal:9000` (puerto publicado en el host), no por el hostname `minio` de otra red Compose.

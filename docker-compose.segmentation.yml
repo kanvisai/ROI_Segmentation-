@@ -1,0 +1,32 @@
+services:
+  kanvis-segmentation:
+    image: kanvis-segmentation:gpu
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: gpu
+    environment:
+      KANVIS_SEGMENTATION_LISTEN: "0.0.0.0:50100"
+      KANVIS_SEGMENTATION_METRICS_PORT: "9109"
+      SEGMENTATION_S3_ENDPOINT_URL: "${SEGMENTATION_S3_ENDPOINT_URL:-http://host.docker.internal:9000}"
+      SEGMENTATION_S3_ACCESS_KEY_ID: "${SEGMENTATION_S3_ACCESS_KEY_ID:-minioadmin}"
+      SEGMENTATION_S3_SECRET_ACCESS_KEY: "${SEGMENTATION_S3_SECRET_ACCESS_KEY:-minioadmin}"
+      SEGMENTATION_S3_REGION: "${SEGMENTATION_S3_REGION:-us-east-1}"
+      SEGMENTATION_S3_SECURE: "${SEGMENTATION_S3_SECURE:-false}"
+      SEGMENTATION_SAM3_SUMMARY: "true"
+      SEGMENTATION_SAM3_MIN_WRIST_VISIBLE_FRAMES: "3"
+      SEGMENTATION_SAM3_WRIST_MATCH_MAX_PX: "140"
+      SEGMENTATION_IDENTIFIERS_YAML: "/app/identifiers.yaml"
+      SEGMENTATION_WORK_DIR: "/tmp/kanvis-segmentation"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "50100:50100"
+      - "9109:9109"
+    volumes:
+      - segmentation-work:/tmp/kanvis-segmentation
+    gpus: all
+    restart: unless-stopped
+
+volumes:
+  segmentation-work:
