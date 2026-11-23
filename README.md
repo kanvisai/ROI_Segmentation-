@@ -640,7 +640,7 @@ Por clip y tecnología, en `salidas/<tecnologia>/<stem>/`:
 
 ### `tracking.json` (pipeline común)
 
-Cabecera: `video`, `model`, `width`, `height`, `frames`, `source_frames`, `fps`, `output_fps`, `sampling`, `pose_backend` (`yolo-pose` o `mediapipe`), `hands_visible` (bool), `final_state` (del clip), `inside_container_confidence` / `cell_phone_confidence` si aplican, `session_person_anchor`, `seed_frame`, `frames_locked`, `frames_lost`, `max_candidates`, `parameters`, `identifiers_yaml`.
+Cabecera: `video`, `model`, `width`, `height`, `frames`, `source_frames`, `fps`, `output_fps`, `sampling`, `pose_backend` (`yolo-pose` o `mediapipe`), `hands_visible` (bool), `final_state` (del clip), `inside_container_confidence` / `cell_phone_confidence` si aplican, `object_category` / `object_confidence` si el objeto ganador tiene clase YOLO, `session_person_anchor`, `seed_frame`, `frames_locked`, `frames_lost`, `max_candidates`, `parameters`, `identifiers_yaml`.
 
 `final_state` del clip: si no hay muñecas, `no_hands`. Si hay muñecas pero ningún objeto, `no_data`. Si hay varios objetos, gana el de mayor prioridad (`inside_container` > `disappeared` > `in_hand` > `released`). Un puño que sigue `in_hand` no tapa la ocultación. Si el clip es `inside_container`, la cabecera incluye `inside_container_confidence` (el del objeto ganador). `parameters.hand_min_confidence` y `parameters.mediapipe` reflejan el YAML y `--mediapipe`.
 
@@ -669,6 +669,9 @@ Con mp4, `fps` es el del archivo (float) y `parameters.fps` es el `--fps` de mue
 `objects[]`:
 
 - `id`, `frames_visible`, `frames_in_hand`, `first_frame`, `last_frame`, `reseeds`
+- `category`: clase del objeto en mano (`botella`, `celular`, nombre COCO, o `objeto` si SAM no tiene clase)
+- `label`: nombre crudo del detector (p. ej. `bottle`) si hay clase YOLO
+- `confidence` (0–1): score del objeto en mano. Con clase YOLO es el máximo de esa clase en el recorte; si no está clasificado (`category: "objeto"`) es el score de SAM/YOLO o, si no hay, el máximo `grip_score`. Sale también con `--summary` (no hace falta la timeline)
 - `hands`: `{left, right, both, no_hand}`
 - `dominant_hand`
 - `last_roi`, `last_center`, `last_visible_frame`
@@ -680,7 +683,7 @@ Con mp4, `fps` es el del archivo (float) y `parameters.fps` es el `--fps` de mue
 - `events[]`: `appears`, `disappears`, `reappears`, `releases`, `regrasps`, `hand_change` (`from`/`to`)
 - `timeline[]`: `frame`, `processed_frame`, `t`, `hand`, `roi`, `center`, `area`, `grip_score`, `hand_scores`, `origin` (`detection` \| `propagation`)
 
-Con `--summary` el mismo archivo lleva `"summary": true`, omite `objects[].timeline` y `containers[].rois`, y sustituye `parameters.frames_origin` / `sampling.source_indices` por un recuento (y `source_index_span`). Siguen `events[]`, `last_roi`, `final_state`, `inside_container_confidence` (si hay depósito), `cell_phone_confidence` (si hay móvil) y `final_container` (con `confidence`). `summary.txt` también escribe esas confianzas. `containers[]` de un `celular` incluye `confidence`.
+Con `--summary` el mismo archivo lleva `"summary": true`, omite `objects[].timeline` y `containers[].rois`, y sustituye `parameters.frames_origin` / `sampling.source_indices` por un recuento (y `source_index_span`). Siguen `events[]`, `last_roi`, `final_state`, `category` / `confidence` del objeto, `inside_container_confidence` (si hay depósito), `cell_phone_confidence` (si hay móvil) y `final_container` (con `confidence`). `summary.txt` también escribe esas confianzas. `containers[]` de un `celular` incluye `confidence`. `timeline[].grip_score` sigue siendo el agarre, no la confianza de clase.
 
 `hand` en JSON es `left` / `right` / `both` / `no_hand`. En el overlay se abrevia `L` / `R` / `BOTH` / `FREE`. Izquierda y derecha son las **de la persona**.
 

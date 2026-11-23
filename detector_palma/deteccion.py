@@ -410,12 +410,20 @@ class GeneradorMascarasSAM:
 
         instancias: list[Instancia] = []
         datos = resultado.masks.data.cpu().numpy()
+        boxes = getattr(resultado, "boxes", None)
+        confs = getattr(boxes, "conf", None) if boxes is not None else None
+        mask_confs = getattr(resultado.masks, "conf", None)
         for i, bruta in enumerate(datos):
             mascara = redimensionar_mascara(bruta > 0.5, ancho, alto)
             caja = caja_desde_mascara(mascara)
             if caja is None:
                 continue
+            score = 0.0
+            if confs is not None and i < len(confs):
+                score = float(confs[i])
+            elif mask_confs is not None and i < len(mask_confs):
+                score = float(mask_confs[i])
             instancias.append(
-                Instancia(mascara=mascara, caja=caja, etiqueta="objeto", score=1.0 - i * 1e-3)
+                Instancia(mascara=mascara, caja=caja, etiqueta="objeto", score=score)
             )
         return instancias

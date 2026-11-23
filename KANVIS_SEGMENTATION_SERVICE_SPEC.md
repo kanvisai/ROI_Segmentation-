@@ -223,6 +223,7 @@ message HealthCheckResponse {
 - `final_state` — e.g. `in_hand`, `inside_container`, `disappeared`, `no_hands`, `no_data`, …
 - `hands_visible` — boolean
 - Fields needed to derive C3 confidences (phone, container), as today in `summarize_tracking_for_c3()`.
+- Additive (tracking only, **not** in `roi_fp_review`): `object_category` / `object_confidence` on the clip header, and `objects[].category` / `objects[].confidence` / `objects[].label`. Unclassified SAM objects keep `category: "objeto"` but still emit `confidence` (SAM/YOLO score, or grip if that is all). Do not confuse classified YOLO confidence with `timeline[].grip_score`.
 
 **Reference implementation (read-only for you):**
 

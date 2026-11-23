@@ -33,6 +33,12 @@ import torch
 import yaml
 
 from detector_palma.agarre import anotar_agarre, es_voluminoso, mascara_es_la_mano, puntuar_agarre
+from detector_palma.etiquetas import (
+    es_clase_nombrada,
+    heredar_etiqueta,
+    mezclar_votos_clase,
+    resumir_deteccion_objeto,
+)
 from detector_palma.geometria import caja_desde_mascara, iou_cajas
 from detector_palma.personas import (
     CADERA_DER,
@@ -225,6 +231,11 @@ class Objeto:
     resiembras: int = 0
     centro: tuple[float, float] | None = None
     ultimo_frame: int = -1
+    categoria: str = "objeto"
+    confianza: float | None = None
+    etiqueta: str = "objeto"
+    etiquetas: dict = field(default_factory=dict)
+    det_scores: dict = field(default_factory=dict)
 
 
 def comprobar_entorno() -> None:
@@ -821,7 +832,14 @@ def _clip_instancia_a_palma(
     minima = max(40, int(getattr(args, "area_min", 80) or 80) // 2)
     if int(np.count_nonzero(recorte)) < minima:
         return None
-    return Instancia.desde_mascara(recorte, etiqueta=str(getattr(inst, "etiqueta", "objeto") or "objeto"))
+    extra = dict(getattr(inst, "extra", None) or {})
+    return Instancia.desde_mascara(
+        recorte,
+        etiqueta=str(getattr(inst, "etiqueta", "objeto") or "objeto"),
+        score=float(getattr(inst, "score", 0.0) or 0.0),
+        extra=extra,
+        score_agarre=float(getattr(inst, "score_agarre", 0.0) or 0.0),
+    )
 
 
 def _parece_estanteria(inst: Instancia, mano, contexto) -> bool:
@@ -944,7 +962,7 @@ def _semilla_objeto_en_punyo(mano, alto: int, ancho: int) -> Instancia | None:
     disco = (xx - cx) ** 2 + (yy - cy) ** 2 <= rp * rp
     if int(np.count_nonzero(disco)) < 40:
         return None
-    return Instancia.desde_mascara(disco, etiqueta="objeto")
+    return Instancia.desde_mascara(disco, etiqueta="objeto", score=0.0)
 
 
 def candidatos_en_munecas(frame, contexto, detector, sam, args) -> list[Instancia]:
@@ -1030,6 +1048,7 @@ def candidatos_en_munecas(frame, contexto, detector, sam, args) -> list[Instanci
                 and _forma_de_objeto(semilla, args)
             ):
                 candidatos.append(semilla)
+    _transferir_etiquetas_yolo(candidatos)
     return _sin_duplicados(candidatos)
 
 
@@ -1112,15 +1131,33 @@ def _solapan(a: np.ndarray, b: np.ndarray, umbral: float = 0.5) -> bool:
     return interseccion / max(1, menor) >= umbral
 
 
+def _transferir_etiquetas_yolo(candidatos: list[Instancia]) -> None:
+    """SAM no tiene clase COCO: hereda etiqueta y score del YOLO que solapa el mismo recorte."""
+    nombradas = [i for i in candidatos if es_clase_nombrada(getattr(i, "etiqueta", ""))]
+    if not nombradas:
+        return
+    for inst in candidatos:
+        for otro in nombradas:
+            if otro is inst:
+                continue
+            if iou_cajas(inst.caja, otro.caja) >= 0.15 or _solapan(inst.mascara, otro.mascara, 0.2):
+                heredar_etiqueta(inst, otro)
+
+
 def _sin_duplicados(candidatos: list[Instancia], iou_max: float = 0.55) -> list[Instancia]:
     """El mismo objeto lo pueden ver el modelo de segmentación y SAM a la vez."""
     ordenados = sorted(candidatos, key=lambda i: i.area)
     salida: list[Instancia] = []
     for inst in ordenados:
-        if any(
-            iou_cajas(inst.caja, ya.caja) > iou_max or _solapan(inst.mascara, ya.mascara)
-            for ya in salida
-        ):
+        destino = next(
+            (
+                ya for ya in salida
+                if iou_cajas(inst.caja, ya.caja) > iou_max or _solapan(inst.mascara, ya.mascara)
+            ),
+            None,
+        )
+        if destino is not None:
+            heredar_etiqueta(destino, inst)
             continue
         salida.append(inst)
     return salida
@@ -3445,6 +3482,7 @@ def detectar_objetos(frames, escena, detector, sam, args):
                 mejor["ultimo_frame"] = indice
                 mejor["mascaras"][indice] = inst.mascara
                 mejor["agarres"][indice] = agarre
+                _anotar_clase_en_pista(mejor, indice, inst)
             else:
                 pistas.append(
                     {
@@ -3454,6 +3492,12 @@ def detectar_objetos(frames, escena, detector, sam, args):
                         "ultimo_frame": indice,
                         "mascaras": {indice: inst.mascara},
                         "agarres": {indice: agarre},
+                        "etiquetas": {
+                            indice: str(getattr(inst, "etiqueta", "objeto") or "objeto")
+                        },
+                        "det_scores": {
+                            indice: float(getattr(inst, "score", 0.0) or 0.0)
+                        },
                     }
                 )
         if indice % 20 == 0:
@@ -3558,6 +3602,65 @@ def detectar_objetos(frames, escena, detector, sam, args):
     return contextos, pistas
 
 
+def _anotar_clase_en_pista(pista: dict, indice: int, inst: Instancia) -> None:
+    pista.setdefault("etiquetas", {})[indice] = str(getattr(inst, "etiqueta", "objeto") or "objeto")
+    pista.setdefault("det_scores", {})[indice] = float(getattr(inst, "score", 0.0) or 0.0)
+
+
+def _mezclar_clases_pista(destino: dict, pista: dict) -> None:
+    etiq, sc = mezclar_votos_clase(
+        destino.get("etiquetas"),
+        destino.get("det_scores"),
+        pista.get("etiquetas"),
+        pista.get("det_scores"),
+    )
+    destino["etiquetas"] = etiq
+    destino["det_scores"] = sc
+
+
+def _agarres_objeto(objeto: Objeto) -> list[float]:
+    return [
+        float(v.score)
+        for v in (getattr(objeto, "vistas", None) or {}).values()
+        if float(getattr(v, "score", 0.0) or 0.0) > 0.0
+    ]
+
+
+def _aplicar_clase_objeto(objeto: Objeto, etiquetas: dict | None, scores: dict | None) -> None:
+    objeto.etiquetas = dict(etiquetas or {})
+    objeto.det_scores = dict(scores or {})
+    cat, conf, raw = resumir_deteccion_objeto(
+        objeto.etiquetas, objeto.det_scores, _agarres_objeto(objeto)
+    )
+    objeto.categoria = cat
+    objeto.confianza = conf
+    objeto.etiqueta = raw
+
+
+def _asegurar_confianza_objeto(objeto: Objeto) -> None:
+    """Con --summary no hay timeline: la confianza tiene que vivir en el objeto."""
+    cat, conf, raw = resumir_deteccion_objeto(
+        getattr(objeto, "etiquetas", None),
+        getattr(objeto, "det_scores", None),
+        _agarres_objeto(objeto),
+    )
+    objeto.categoria = cat or getattr(objeto, "categoria", None) or "objeto"
+    objeto.confianza = conf
+    objeto.etiqueta = raw or getattr(objeto, "etiqueta", None) or "objeto"
+
+
+def _copiar_clase_desde_pistas(objetos: list[Objeto], pistas) -> None:
+    """Cutie/SAM2 no copian la clase YOLO; se recupera de la pista de muñeca."""
+    por_id = {p["id"]: p for p in pistas or []}
+    for objeto in objetos:
+        if getattr(objeto, "etiquetas", None):
+            continue
+        pista = por_id.get(objeto.id)
+        if pista is None:
+            continue
+        _aplicar_clase_objeto(objeto, pista.get("etiquetas"), pista.get("det_scores"))
+
+
 def fusionar_pistas(pistas: list[dict], comunes_min: int = 2, iou_min: float = 0.3) -> list[dict]:
     """Dos pistas que ven la misma máscara en los mismos frames son un solo objeto."""
     fusionadas: list[dict] = []
@@ -3580,6 +3683,7 @@ def fusionar_pistas(pistas: list[dict], comunes_min: int = 2, iou_min: float = 0
         for frame, mascara in pista["mascaras"].items():
             destino["mascaras"].setdefault(frame, mascara)
             destino["agarres"].setdefault(frame, pista["agarres"][frame])
+        _mezclar_clases_pista(destino, pista)
         destino["primer_frame"] = min(destino["primer_frame"], pista["primer_frame"])
         if pista["ultimo_frame"] > destino["ultimo_frame"]:
             destino["ultimo_frame"] = pista["ultimo_frame"]
@@ -3652,6 +3756,7 @@ def unir_tramos(pistas: list[dict], args, contextos=None) -> list[dict]:
         for frame, mascara in pista["mascaras"].items():
             destino["mascaras"].setdefault(frame, mascara)
             destino["agarres"].setdefault(frame, pista["agarres"][frame])
+        _mezclar_clases_pista(destino, pista)
         if pista["ultimo_frame"] > destino["ultimo_frame"]:
             destino["ultimo_frame"] = pista["ultimo_frame"]
             destino["centro"] = pista["centro"]
@@ -4079,6 +4184,7 @@ def objetos_desde_pistas(pistas, contextos, args) -> list[Objeto]:
     objetos: list[Objeto] = []
     for pista in pistas:
         objeto = Objeto(id=pista["id"], semillas=pista["mascaras"], mascaras=dict(pista["mascaras"]))
+        _aplicar_clase_objeto(objeto, pista.get("etiquetas"), pista.get("det_scores"))
         if objeto.mascaras:
             ultimo = max(objeto.mascaras)
             ys, xs = np.nonzero(objeto.mascaras[ultimo])
@@ -4377,6 +4483,13 @@ def fusionar_objetos(objetos: list[Objeto], comunes_min: int = 1, solape_min: fl
                             ya.vistas[frame] = vista
                     if frame in objeto.mascaras:
                         ya.mascaras.setdefault(frame, objeto.mascaras[frame])
+                etiq, sc = mezclar_votos_clase(
+                    getattr(ya, "etiquetas", None),
+                    getattr(ya, "det_scores", None),
+                    getattr(objeto, "etiquetas", None),
+                    getattr(objeto, "det_scores", None),
+                )
+                _aplicar_clase_objeto(ya, etiq, sc)
                 print(f"  Objeto {objeto.id} se une al {ya.id}: mismo objeto a dos manos")
                 break
         if not duplicado:
@@ -5441,7 +5554,14 @@ def anotar(frames, destino: Path, objetos: list[Objeto], contenedores, fps_salid
                     _aviso(f"frame {orig}: overlay de objeto {objeto.id} falló ({exc})")
                 x1, y1, x2, y2 = vista.caja
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                etiqueta_obj = f"obj {objeto.id} {_etiqueta_mano(vista.mano)} {vista.score:.2f}"
+                cat_obj = getattr(objeto, "categoria", None) or "objeto"
+                conf_obj = getattr(objeto, "confianza", None)
+                etiqueta_obj = cat_obj if cat_obj != "objeto" else f"obj {objeto.id}"
+                if conf_obj is not None:
+                    etiqueta_obj += f" {conf_obj:.2f}"
+                elif cat_obj == "objeto":
+                    etiqueta_obj += f" {vista.score:.2f}"
+                etiqueta_obj += f" {_etiqueta_mano(vista.mano)}"
                 info_obj = next(
                     (i for i in (informes or []) if i.get("id") == objeto.id),
                     None,
@@ -5566,6 +5686,7 @@ def informe_objeto(objeto: Objeto, fps: float, nframes: int, contenedores, args,
         contenedor["confidence"] = conf_deposito
     informe = {
         "id": objeto.id,
+        "category": getattr(objeto, "categoria", None) or "objeto",
         "frames_visible": len(vistas),
         "frames_in_hand": len(en_mano),
         "first_frame": orig(vistas[0].frame) if vistas else None,
@@ -5584,6 +5705,14 @@ def informe_objeto(objeto: Objeto, fps: float, nframes: int, contenedores, args,
         "events": eventos_en,
         "timeline": linea,
     }
+    raw_lab = getattr(objeto, "etiqueta", None)
+    if raw_lab and es_clase_nombrada(raw_lab):
+        informe["label"] = raw_lab
+    _asegurar_confianza_objeto(objeto)
+    conf_obj = getattr(objeto, "confianza", None)
+    if conf_obj is not None:
+        informe["confidence"] = float(conf_obj)
+    informe["category"] = getattr(objeto, "categoria", None) or informe.get("category") or "objeto"
     if estado == "inside_container" and conf_deposito is not None:
         informe["inside_container_confidence"] = conf_deposito
     conf_cel = _confianza_celular_de_objeto(objeto, contenedores)
@@ -5596,7 +5725,9 @@ def resumen(video: Path, informes: list[dict], contenedores, nframes: int, model
             yaml_identificadores: Path | None = None, muestreo: dict | None = None,
             final_state: str | None = None, pose_backend: str = "yolo-pose",
             inside_container_confidence: float | None = None,
-            cell_phone_confidence: float | None = None) -> str:
+            cell_phone_confidence: float | None = None,
+            object_category: str | None = None,
+            object_confidence: float | None = None) -> str:
     lineas = [
         f"Video: {video}",
         f"Processed frames: {nframes}",
@@ -5617,6 +5748,13 @@ def resumen(video: Path, informes: list[dict], contenedores, nframes: int, model
             lineas.append(f"final_state: {final_state}")
     if cell_phone_confidence is not None:
         lineas.append(f"cell_phone_confidence: {float(cell_phone_confidence):.2f}")
+    if object_category:
+        if object_confidence is not None:
+            lineas.append(
+                f"object: {object_category} (confidence {float(object_confidence):.2f})"
+            )
+        else:
+            lineas.append(f"object: {object_category}")
     lineas.append("")
     if contenedores:
         lineas.append("Scene identifiers:")
@@ -5648,8 +5786,16 @@ def resumen(video: Path, informes: list[dict], contenedores, nframes: int, model
         return "\n".join(lineas) + "\n"
     for info in informes:
         manos = info["hands"]
+        cat = info.get("category")
+        conf_det = info.get("confidence")
+        nombre = f"Object {info['id']}"
+        if cat:
+            if conf_det is not None:
+                nombre = f"Object {info['id']} ({cat} {float(conf_det):.2f})"
+            else:
+                nombre = f"Object {info['id']} ({cat})"
         lineas.append(
-            f"Object {info['id']}: visible in {info['frames_visible']} frames, "
+            f"{nombre}: visible in {info['frames_visible']} frames, "
             f"in hand in {info['frames_in_hand']} "
             f"(left {manos['left']}, right {manos['right']}, both {manos['both']})"
         )
@@ -6120,6 +6266,8 @@ def escribir_salidas(
     for pista in contenedores:
         if pista.get("categoria") == "celular":
             pista["confidence"] = confianza_celular(pista, contextos)
+    for o in objetos:
+        _asegurar_confianza_objeto(o)
     informes = [
         informe_objeto(o, fps, nframes, contenedores, args, indices_origen, contextos)
         for o in objetos
@@ -6144,11 +6292,16 @@ def escribir_salidas(
     def orig(idx: int) -> int:
         return frame_origen(idx, indices_origen)
 
+    ganador = _informe_estado_video(informes)
     if extra.get("final_state") is None:
-        ganador = _informe_estado_video(informes)
         extra["final_state"] = ganador["final_state"] if ganador else "no_data"
         if ganador and ganador.get("final_state") == "inside_container":
             extra["inside_container_confidence"] = ganador.get("inside_container_confidence")
+    if ganador:
+        if ganador.get("category"):
+            extra.setdefault("object_category", ganador["category"])
+        if ganador.get("confidence") is not None:
+            extra.setdefault("object_confidence", ganador["confidence"])
     confs_cel = [
         float(p["confidence"]) for p in contenedores
         if p.get("categoria") == "celular" and p.get("confidence") is not None
@@ -6174,6 +6327,8 @@ def escribir_salidas(
         "final_state": extra.get("final_state"),
         "inside_container_confidence": extra.get("inside_container_confidence"),
         "cell_phone_confidence": extra.get("cell_phone_confidence"),
+        "object_category": extra.get("object_category"),
+        "object_confidence": extra.get("object_confidence"),
         "parameters": {
             "input": extra.get("input", "video"),
             "wrist_padding": args.padding_muneca,
@@ -6240,6 +6395,10 @@ def escribir_salidas(
         traza.pop("inside_container_confidence", None)
     if traza.get("cell_phone_confidence") is None:
         traza.pop("cell_phone_confidence", None)
+    if traza.get("object_category") is None:
+        traza.pop("object_category", None)
+    if traza.get("object_confidence") is None:
+        traza.pop("object_confidence", None)
     if extra:
         for clave, valor in extra.items():
             if clave not in traza or traza[clave] is None:
@@ -6254,6 +6413,8 @@ def escribir_salidas(
         final_state=traza.get("final_state"), pose_backend=pose_backend,
         inside_container_confidence=traza.get("inside_container_confidence"),
         cell_phone_confidence=traza.get("cell_phone_confidence"),
+        object_category=traza.get("object_category"),
+        object_confidence=traza.get("object_confidence"),
     )
     (destino / "summary.txt").write_text(texto, encoding="utf-8")
     (destino / "metrics.json").write_text(
@@ -6377,6 +6538,7 @@ def procesar_video(
                     _aviso(f"{video.name}: el seguidor de máscara falló ({exc})")
                     traceback.print_exc()
                     objetos = objetos_desde_pistas(pistas, contextos, args) if pistas else []
+                _copiar_clase_desde_pistas(objetos, pistas)
                 contenedores = seguir_contenedores(
                     frames_proc, det_contenedores, args.cada_contenedor, contextos=contextos
                 )
