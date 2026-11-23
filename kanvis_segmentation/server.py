@@ -109,7 +109,9 @@ class SegmentationLogic:
 
             client = s3_client(self.settings)
             session_root = materialize_job(client, job, work)
-            bundle = load_local_bundle(session_root, job.chunk_stems, self.settings)
+            bundle = load_local_bundle(
+                session_root, job.chunk_stems, self.settings, span=job.extra
+            )
             with self._lock:
                 result = run_sam3_on_bundle(
                     bundle, self.settings, work_dir=work / "run", detectores=self._detectores

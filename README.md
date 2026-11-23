@@ -807,10 +807,10 @@ No se usa el 50052 (C2). El gRPC de este servicio es **50100**.
 
 ### Qué hace una petición
 
-1. Resuelve la sesión por campos tenant (`bucket`, `retail_id`, `store_id`, `camera_id`, `session_id`, `chunk_stem`) o por refs C2 (`source_ref`, `pose_chunk_ref`, `image_chunk_ref`).
-2. Baja `chunk_XXX/frames/`, `frames_meta.json` y `poses_full.npy` (si falta: `poses_compat.npy` / `poses.npy`).
-3. Ancla al sujeto de la sesión (muñecas C1) y corre SAM 3.
-4. Responde `tracking_json` (compacto) y `roi_fp_review_json`. Con `persist_to_minio=true` y `dry_run=false` escribe `…/chunk_XXX/roi_tracking.json`.
+1. Resuelve la sesión por campos tenant (`bucket`, `retail_id`, `store_id`, `camera_id`, `session_id`, `chunk_stem`) o por refs C2 (`source_ref`, `pose_chunk_ref`, `image_chunk_ref`). `pose_chunk_ref` / `image_chunk_ref` pueden ser relativos al `source_ref` (`chunk_001/poses_full.npy`).
+2. Baja `chunk_XXX/frames/`, `frames_meta.json` y `poses_full.npy` (si falta: `poses_compat.npy` / `poses.npy`). Con `span_spec=overlap_half:chunk_001:chunk_002:ratio=0.5000` usa la **última mitad** de `chunk_001` y la **primera mitad** de `chunk_002` (24 JPEGs → 12+12). `with_next` sigue concatenando carpetas completas.
+3. Ancla al sujeto de la sesión (muñecas C1) y corre SAM 3. El gate de muñecas mira solo los `frames_meta` de la ventana.
+4. Responde `tracking_json` (compacto, con `p1_motion_stem` / `frames_used` en solape) y `roi_fp_review_json`. Con `persist_to_minio=true` y `dry_run=false` escribe `…/chunk_XXX/roi_tracking.json` en el **ancla** (`chunk_001`, no `chunk_001_002/`).
 
 RPC: `ApplySegmentation`, `HealthCheck`. Proto: `proto/kanvis/segmentation/v1/segmentation.proto`.
 
@@ -856,6 +856,11 @@ TARGET=localhost:50100 FORCE_RPC=1 bash scripts/smoke_grpc.sh
 export SOURCE_REF="s3://kanvis-chunks/sessions/<retail>/<store>/<camera>/<session>/"
 export POSE_REF="${SOURCE_REF}chunk_001/poses_full.npy"
 export TARGET="localhost:50100"
+DRY_RUN=1 bash scripts/smoke_minio.sh
+
+# Solape C3 (mitad final de chunk_001 + mitad inicial de chunk_002)
+SPAN_SPEC='overlap_half:chunk_001:chunk_002:ratio=0.5000' \
+CHUNK_STEM=chunk_001_002 \
 DRY_RUN=1 bash scripts/smoke_minio.sh
 
 # Offline, sin MinIO

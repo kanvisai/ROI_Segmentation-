@@ -17,6 +17,7 @@ from .contracts import (
     slim_tracking_payload_for_storage,
     summarize_tracking_for_c3,
 )
+from .refs import overlap_half_counts, overlap_half_indices
 from .session_anchor import (
     PersonFilterInstall,
     SessionRoiAnchor,
@@ -60,42 +61,114 @@ def load_chunk_frames(chunk_dir: Path) -> tuple[list[np.ndarray], list[int]]:
     return cargar_carpeta_frames(chunk_dir)
 
 
+def _rows_for_chunk(chunk_dir: Path) -> dict[str, Any]:
+    fr, orig = load_chunk_frames(chunk_dir)
+    meta_rows = load_frames_meta(chunk_dir)
+    origins: list[int] = []
+    metas: list[dict] = []
+    for i, _img in enumerate(fr):
+        meta_row = meta_rows[i] if i < len(meta_rows) else {}
+        origins.append(pose_row_index(int(orig[i]) if i < len(orig) else i, meta_row))
+        metas.append(meta_row)
+    return {
+        "frames": fr,
+        "origin": origins,
+        "metas": metas,
+        "poses": load_poses(chunk_dir),
+        "fps": _fps_from_meta(chunk_dir, 12),
+    }
+
+
 def load_local_bundle(
     session_root: Path,
     chunk_stems: tuple[str, ...],
     settings: Settings | None = None,
+    span: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     settings = settings or load_settings()
-    frames: list[np.ndarray] = []
-    origin: list[int] = []
-    chunk_names: list[str] = []
-    metas: list[dict] = []
+    span = dict(span or {})
+    loaded: dict[str, dict[str, Any]] = {}
+    present: list[str] = []
     poses_by_chunk: dict[str, np.ndarray] = {}
     fps = 12
-    width = height = 0
-    present = []
     for stem in chunk_stems:
         chunk_dir = session_root / stem
         if not chunk_dir.is_dir():
             continue
-        present.append(stem)
-        fr, orig = load_chunk_frames(chunk_dir)
-        if not fr:
+        rows = _rows_for_chunk(chunk_dir)
+        if not rows["frames"]:
             continue
-        fps = _fps_from_meta(chunk_dir, fps)
-        meta_rows = load_frames_meta(chunk_dir)
-        poses = load_poses(chunk_dir)
-        if poses is not None:
-            poses_by_chunk[stem] = poses
-        for i, img in enumerate(fr):
-            frames.append(img)
-            meta_row = meta_rows[i] if i < len(meta_rows) else {}
-            origin.append(pose_row_index(int(orig[i]) if i < len(orig) else i, meta_row))
-            chunk_names.append(stem)
-            metas.append(meta_row)
-        height, width = fr[0].shape[:2]
+        loaded[stem] = rows
+        present.append(stem)
+        fps = rows["fps"] or fps
+        if rows["poses"] is not None:
+            poses_by_chunk[stem] = rows["poses"]
+
+    frames: list[np.ndarray] = []
+    origin: list[int] = []
+    chunk_names: list[str] = []
+    metas: list[dict] = []
+    frames_used: dict[str, list[int]] = {}
+    overlap_info: dict[str, Any] = {}
+
+    if span.get("span_mode") == "overlap_half":
+        left = str(span.get("overlap_left") or (chunk_stems[0] if chunk_stems else ""))
+        right = str(span.get("overlap_right") or (chunk_stems[1] if len(chunk_stems) > 1 else ""))
+        ratio = float(span.get("overlap_ratio") if span.get("overlap_ratio") is not None else 0.5)
+        if left not in loaded or right not in loaded:
+            raise FileNotFoundError(
+                f"overlap_half missing chunks left={left} right={right} present={present}"
+            )
+        n_left = len(loaded[left]["frames"])
+        n_right = len(loaded[right]["frames"])
+        k_left, k_right = overlap_half_counts(n_left, n_right, ratio)
+        left_idx, right_idx = overlap_half_indices(n_left, n_right, ratio)
+        print(
+            f"  overlap_half stems={left}+{right} ratio={ratio:.4f} "
+            f"k_left={k_left}/{n_left} k_right={k_right}/{n_right} "
+            f"frames={k_left + k_right}"
+        )
+        frames_used = {"left": left_idx, "right": right_idx}
+        poses_l = poses_by_chunk.get(left)
+        poses_r = poses_by_chunk.get(right)
+        pk_left, pk_right = overlap_half_counts(
+            0 if poses_l is None else len(poses_l),
+            0 if poses_r is None else len(poses_r),
+            ratio,
+        )
+        overlap_info = {
+            "left": left,
+            "right": right,
+            "ratio": ratio,
+            "k_left": k_left,
+            "k_right": k_right,
+            "n_left": n_left,
+            "n_right": n_right,
+            "poses_k_left": pk_left,
+            "poses_k_right": pk_right,
+        }
+        for i in left_idx:
+            frames.append(loaded[left]["frames"][i])
+            origin.append(loaded[left]["origin"][i])
+            chunk_names.append(left)
+            metas.append(loaded[left]["metas"][i])
+        for i in right_idx:
+            frames.append(loaded[right]["frames"][i])
+            origin.append(loaded[right]["origin"][i])
+            chunk_names.append(right)
+            metas.append(loaded[right]["metas"][i])
+    else:
+        for stem in present:
+            rows = loaded[stem]
+            for i, img in enumerate(rows["frames"]):
+                frames.append(img)
+                origin.append(rows["origin"][i])
+                chunk_names.append(stem)
+                metas.append(rows["metas"][i])
+
     if not frames:
         raise FileNotFoundError(f"no frames in {session_root} chunks={chunk_stems}")
+    height, width = frames[0].shape[:2]
     return {
         "frames": frames,
         "frames_origin": origin,
@@ -107,7 +180,24 @@ def load_local_bundle(
         "height": height,
         "chunks": present,
         "wrist_match_max_px": settings.wrist_match_max_px,
+        "span_spec": span.get("span_spec") or "",
+        "p1_motion_stem": span.get("p1_motion_stem") or "",
+        "frames_used": frames_used,
+        "overlap": overlap_info,
     }
+
+
+def _attach_span_fields(tracking: dict[str, Any], bundle: dict[str, Any]) -> dict[str, Any]:
+    out = dict(tracking)
+    if bundle.get("span_spec"):
+        out["span_spec"] = bundle["span_spec"]
+    if bundle.get("p1_motion_stem"):
+        out["p1_motion_stem"] = bundle["p1_motion_stem"]
+    if bundle.get("frames_used"):
+        out["frames_used"] = bundle["frames_used"]
+    if bundle.get("overlap"):
+        out["overlap"] = bundle["overlap"]
+    return out
 
 
 def skipped_payload(*, reason: str, hands_visible: bool = False) -> dict[str, Any]:
@@ -173,6 +263,7 @@ def run_sam3_on_bundle(
             reason=f"wrist_gate visibles={visibles}/{total}",
             hands_visible=False,
         )
+        tracking = _attach_span_fields(tracking, bundle)
         tracking = slim_tracking_payload_for_storage(tracking)
         return SegmentationResult(
             status="skipped",
@@ -241,6 +332,7 @@ def run_sam3_on_bundle(
     tracking["session_person_anchor"] = "wrist_c1" if anchor.poses_by_chunk else tracking.get(
         "session_person_anchor"
     )
+    tracking = _attach_span_fields(tracking, bundle)
     tracking = slim_tracking_payload_for_storage(tracking)
     status = rpc_status_from_tracking(tracking)
     return SegmentationResult(
@@ -263,9 +355,25 @@ def run_local_session(
     work_dir: Path | None = None,
     detectores=None,
 ) -> SegmentationResult:
-    from .refs import parse_span_spec
+    from .refs import parse_overlap_half, parse_span_spec, p1_overlap_stem
 
     settings = settings or load_settings()
-    stems = parse_span_spec(span_spec, chunk_stem)
-    bundle = load_local_bundle(Path(session_root), stems, settings)
+    overlap = parse_overlap_half(span_spec)
+    span: dict[str, Any] = {"span_spec": span_spec}
+    if overlap:
+        left, right, ratio = overlap
+        stems = (left, right)
+        span.update(
+            {
+                "span_mode": "overlap_half",
+                "overlap_left": left,
+                "overlap_right": right,
+                "overlap_ratio": ratio,
+                "p1_motion_stem": p1_overlap_stem(left, right),
+            }
+        )
+    else:
+        stems = parse_span_spec(span_spec, chunk_stem)
+        span["p1_motion_stem"] = chunk_stem
+    bundle = load_local_bundle(Path(session_root), stems, settings, span=span)
     return run_sam3_on_bundle(bundle, settings, work_dir=work_dir, detectores=detectores)

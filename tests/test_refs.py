@@ -37,7 +37,11 @@ def test_structured_path():
 def test_span_with_prev_next():
     assert parse_span_spec("with_next", "chunk_001") == ("chunk_001", "chunk_002")
     assert parse_span_spec("with_prev", "chunk_002") == ("chunk_001", "chunk_002")
+    assert parse_span_spec("next", "chunk_001") == ("chunk_002",)
     assert parse_span_spec("chunk_002,chunk_003", "chunk_003") == ("chunk_002", "chunk_003")
+    assert parse_span_spec(
+        "overlap_half:chunk_001:chunk_002:ratio=0.5000", "chunk_001"
+    ) == ("chunk_001", "chunk_002")
 
 
 def test_missing_chunk_raises():

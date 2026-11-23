@@ -19,7 +19,7 @@ if [[ -z "${PYTHON:-}" ]]; then
 fi
 DRY_RUN="${DRY_RUN:-1}"
 
-echo "smoke_minio target=$TARGET dry_run=$DRY_RUN"
+echo "smoke_minio target=$TARGET dry_run=$DRY_RUN span=${SPAN_SPEC:-single}"
 "$PYTHON" "$ROOT/tools/grpc_smoke_client.py" \
   --target "$TARGET" \
   --request-id "$REQUEST_ID" \
@@ -27,6 +27,7 @@ echo "smoke_minio target=$TARGET dry_run=$DRY_RUN"
   --source-ref "$SOURCE_REF" \
   --pose-chunk-ref "$POSE_REF" \
   --span-spec "${SPAN_SPEC:-single}" \
+  --chunk-stem "${CHUNK_STEM:-}" \
   --dry-run "$DRY_RUN"
 
 echo "PASS smoke_minio"

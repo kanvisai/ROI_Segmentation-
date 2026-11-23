@@ -167,7 +167,8 @@ message SegmentationRequest {
   string pose_chunk_ref = 5;    // e.g. .../chunk_003/poses_full.npy
   string image_chunk_ref = 6;   // optional .../chunk_003/frames/
 
-  // Span: "", "single", "with_prev", "with_next", "chunk_002,chunk_003"
+  // Span: "", "single", "with_prev", "with_next", "next", "chunk_002,chunk_003",
+  // or C3 overlap: "overlap_half:chunk_001:chunk_002:ratio=0.5000"
   string span_spec = 7;
 
   // If true, write roi_tracking.json under chunk anchor in MinIO
@@ -266,6 +267,8 @@ Your service must load, for every chunk in `span_spec`:
 
 - `frames/` + `frames_meta.json`
 - `poses_full.npy` (fallback `poses_compat.npy` / `poses.npy`)
+
+**Overlap window (C3 `overlap_half:{left}:{right}:ratio={ratio}`):** download both chunks, then take `frames_left[-k:]` + `frames_right[:k]` with `k = max(1, round(n * ratio))` (default ratio `0.5`). Wrist gate runs on the concatenated `frames_meta`. Persist `roi_tracking.json` under the **left/anchor** chunk (`chunk_001/`), not a physical `chunk_001_002/` directory. Logical p1 stem stays in tracking as `p1_motion_stem`. Keep full `poses_full.npy` per chunk so `frames_meta.source_index` still indexes the 12 fps pose timeline.
 
 If you do not implement anchoring, outputs **will diverge** from C2 on busy shop floors.
 
